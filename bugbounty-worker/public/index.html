@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>BBP - API疎通テスト</title>
+<style>
+  body { font-family: sans-serif; max-width: 480px; margin: 3rem auto; padding: 0 1rem; }
+  label { display: block; margin: 1rem 0 0.3rem; font-size: 0.9rem; }
+  input, textarea { width: 100%; padding: 0.5rem; box-sizing: border-box; }
+  button { margin-top: 1.2rem; padding: 0.6rem 1.2rem; cursor: pointer; }
+  pre { background: #f4f4f4; padding: 1rem; margin-top: 1.5rem; white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+  <h1>API疎通テスト</h1>
+  <p>下のフォームを送信すると、Workers側の <code>POST /programs</code> にリクエストが飛びます。<br>
+  <code>npm run dev</code> を実行しているターミナルにログが出れば成功です。</p>
+
+  <form id="form">
+    <label>会社名 *<input name="companyName" required></label>
+    <label>対象スコープ<textarea name="scope" rows="2"></textarea></label>
+    <button type="submit">送信テスト</button>
+  </form>
+
+  <pre id="result">まだ送信していません</pre>
+
+  <script>
+    const API_BASE = "http://localhost:8787"; // wrangler dev のポートに合わせる
+
+    document.getElementById("form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const data = Object.fromEntries(new FormData(e.target).entries());
+      const resultEl = document.getElementById("result");
+      resultEl.textContent = "送信中…";
+
+      try {
+        const res = await fetch(`${API_BASE}/programs`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data),
+        });
+        const json = await res.json();
+        resultEl.textContent = "APIからの返信:\n" + JSON.stringify(json, null, 2);
+      } catch (err) {
+        resultEl.textContent = "エラー: APIに接続できませんでした。\n" +
+          "wrangler dev が起動しているか確認してください。\n\n" + err;
+      }
+    });
+  </script>
+</body>
+</html>
