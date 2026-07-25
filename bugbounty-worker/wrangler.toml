@@ -8,3 +8,6 @@ port = 8787
 binding = "DB"
 database_name = "bbp-db"
 database_id = "dd9ff91f-0451-418f-915d-559ff71b700a"
+[[r2_buckets]]
+binding = "AVATARS"
+bucket_name = "bbp-avatars"
