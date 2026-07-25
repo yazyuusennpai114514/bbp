@@ -99,4 +99,60 @@ app.get("/hunters", async (c) => {
     return c.json({ error: "取得に失敗しました" }, 500);
   }
 });
+// レポート提出
+app.post("/reports", async (c) => {
+  const body = await c.req.json().catch(() => null);
+
+  if (!body || !body.programId || !body.title || !body.severity || !body.description || !body.contactEmail) {
+    return c.json({ error: "必須項目が不足しています" }, 400);
+  }
+
+  const validSeverities = ["critical", "high", "medium", "low"];
+  if (!validSeverities.includes(body.severity)) {
+    return c.json({ error: "severityの値が不正です" }, 400);
+  }
+
+  const id = crypto.randomUUID();
+  const createdAt = Date.now();
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO reports (id, program_id, title, severity, description, poc, contact_email, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        id,
+        body.programId,
+        body.title,
+        body.severity,
+        body.description,
+        body.poc || null,
+        body.contactEmail,
+        "triage待ち",
+        createdAt
+      )
+      .run();
+
+    return c.json({ received: true, id, createdAt });
+  } catch (err) {
+    console.error("D1 insert error:", err);
+    return c.json({ error: "保存に失敗しました" }, 500);
+  }
+});
+
+// 特定プログラムのレポート一覧取得
+app.get("/programs/:id/reports", async (c) => {
+  const programId = c.req.param("id");
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT * FROM reports WHERE program_id = ? ORDER BY created_at DESC`
+    )
+      .bind(programId)
+      .all();
+    return c.json({ reports: results });
+  } catch (err) {
+    console.error("D1 select error:", err);
+    return c.json({ error: "取得に失敗しました" }, 500);
+  }
+});
 export default app;
