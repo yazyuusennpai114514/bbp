@@ -16,11 +16,13 @@
   <p>下のフォームを送信すると、Workers側の <code>POST /programs</code> にリクエストが飛びます。<br>
   <code>npm run dev</code> を実行しているターミナルにログが出れば成功です。</p>
 
-  <form id="form">
-    <label>会社名 *<input name="companyName" required></label>
-    <label>対象スコープ<textarea name="scope" rows="2"></textarea></label>
-    <button type="submit">送信テスト</button>
-  </form>
+<form id="form">
+  <label>会社名 *<input name="companyName" required></label>
+  <label>連絡先メールアドレス *<input name="contactEmail" type="email" required></label>
+  <label>対象スコープ<textarea name="scope" rows="2"></textarea></label>
+  <label>説明 *<textarea name="description" rows="2" required></textarea></label>
+  <button type="submit">送信テスト</button>
+</form>
 
   <pre id="result">まだ送信していません</pre>
   <script>
