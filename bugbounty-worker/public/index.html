@@ -23,29 +23,36 @@
   </form>
 
   <pre id="result">まだ送信していません</pre>
-
   <script>
-    const API_BASE = "https://bbp.hosimatisutazio.workers.dev/"; // wrangler dev のポートに合わせる
+  const API_BASE = "https://bbp.hosimatisutazio.workers.dev";
 
-    document.getElementById("form").addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const data = Object.fromEntries(new FormData(e.target).entries());
-      const resultEl = document.getElementById("result");
-      resultEl.textContent = "送信中…";
+document.getElementById("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const data = Object.fromEntries(new FormData(e.target).entries());
+  const resultEl = document.getElementById("result");
+  resultEl.textContent = "送信中…";
 
-      try {
-        const res = await fetch(`${API_BASE}/programs`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(data),
-        });
-        const json = await res.json();
-        resultEl.textContent = "APIからの返信:\n" + JSON.stringify(json, null, 2);
-      } catch (err) {
-        resultEl.textContent = "エラー: APIに接続できませんでした。\n" +
-          "wrangler dev が起動しているか確認してください。\n\n" + err;
-      }
+  try {
+    const res = await fetch(`${API_BASE}/programs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
     });
-  </script>
+
+    const rawText = await res.text();
+    resultEl.textContent = `ステータス: ${res.status}\n\n生のレスポンス:\n${rawText}`;
+
+    try {
+      const json = JSON.parse(rawText);
+      resultEl.textContent += `\n\nパース成功:\n${JSON.stringify(json, null, 2)}`;
+    } catch (parseErr) {
+      resultEl.textContent += `\n\n※JSONとして解釈できませんでした`;
+    }
+  } catch (err) {
+    resultEl.textContent = "エラー: APIに接続できませんでした。\n" + err;
+  }
+});
+    </script>
+
 </body>
 </html>
