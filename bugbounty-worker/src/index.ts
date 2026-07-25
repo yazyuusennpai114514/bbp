@@ -598,8 +598,13 @@ app.post("/reports", async (c) => {
   }
 });
 
+// プログラム宛のレポート一覧（そのプログラムの企業本人のみ閲覧可）
 app.get("/programs/:id/reports", async (c) => {
   const programId = c.req.param("id");
+  const user = await getSessionUser(c);
+  if (!user || user.userType !== "program" || user.userId !== programId) {
+    return c.json({ error: "権限がありません。ログインし直してください" }, 403);
+  }
   try {
     const { results } = await c.env.DB.prepare(`SELECT * FROM reports WHERE program_id = ? ORDER BY created_at DESC`)
       .bind(programId)
@@ -633,6 +638,82 @@ app.get("/hunters/:id/reports", async (c) => {
   } catch (err) {
     console.error("D1 select error:", err);
     return c.json({ error: "取得に失敗しました" }, 500);
+  }
+});
+
+// 権限チェック：そのレポートの当事者（提出したハンター or 宛先の企業）だけがアクセスできる
+async function getAuthorizedReport(c: any, reportId: string) {
+  const report: any = await c.env.DB.prepare(`SELECT * FROM reports WHERE id = ?`).bind(reportId).first();
+  if (!report) return { report: null, user: null };
+  const user = await getSessionUser(c);
+  const ok =
+    !!user &&
+    ((user.userType === "hunter" && report.hunter_id === user.userId) ||
+      (user.userType === "program" && report.program_id === user.userId));
+  return { report, user: ok ? user : null };
+}
+
+// レポート詳細
+app.get("/reports/:id", async (c) => {
+  const id = c.req.param("id");
+  const { report, user } = await getAuthorizedReport(c, id);
+  if (!report) return c.json({ error: "not found" }, 404);
+  if (!user) return c.json({ error: "権限がありません" }, 403);
+
+  const program = await c.env.DB.prepare(`SELECT id, company_name FROM programs WHERE id = ?`).bind(report.program_id).first();
+  const hunter = report.hunter_id
+    ? await c.env.DB.prepare(`SELECT id, handle FROM hunters WHERE id = ?`).bind(report.hunter_id).first()
+    : null;
+
+  return c.json({ report, program, hunter });
+});
+
+// やり取り（コメント）一覧
+app.get("/reports/:id/comments", async (c) => {
+  const id = c.req.param("id");
+  const { report, user } = await getAuthorizedReport(c, id);
+  if (!report) return c.json({ error: "not found" }, 404);
+  if (!user) return c.json({ error: "権限がありません" }, 403);
+
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT * FROM report_comments WHERE report_id = ? ORDER BY created_at ASC`
+    )
+      .bind(id)
+      .all();
+    return c.json({ comments: results });
+  } catch (err) {
+    console.error("D1 select error:", err);
+    return c.json({ error: "取得に失敗しました" }, 500);
+  }
+});
+
+// やり取り（コメント）を書き込む
+app.post("/reports/:id/comments", async (c) => {
+  const id = c.req.param("id");
+  const { report, user } = await getAuthorizedReport(c, id);
+  if (!report) return c.json({ error: "not found" }, 404);
+  if (!user) return c.json({ error: "権限がありません" }, 403);
+
+  const body = await c.req.json().catch(() => null);
+  if (!body || !body.message || !String(body.message).trim()) {
+    return c.json({ error: "メッセージを入力してください" }, 400);
+  }
+
+  const commentId = crypto.randomUUID();
+  const createdAt = Date.now();
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO report_comments (id, report_id, author_type, author_id, message, created_at) VALUES (?, ?, ?, ?, ?, ?)`
+    )
+      .bind(commentId, id, user.userType, user.userId, String(body.message).trim(), createdAt)
+      .run();
+
+    return c.json({ received: true, id: commentId, createdAt });
+  } catch (err) {
+    console.error("D1 insert error:", err);
+    return c.json({ error: "送信に失敗しました" }, 500);
   }
 });
 
