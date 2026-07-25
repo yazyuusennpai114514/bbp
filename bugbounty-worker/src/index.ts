@@ -61,4 +61,42 @@ app.get("/programs", async (c) => {
     return c.json({ error: "取得に失敗しました" }, 500);
   }
 });
+// ハンター登録
+app.post("/hunters", async (c) => {
+  const body = await c.req.json().catch(() => null);
+
+  if (!body || !body.handle || !body.email) {
+    return c.json({ error: "ハンドルネームとメールアドレスは必須です" }, 400);
+  }
+
+  const id = crypto.randomUUID();
+  const createdAt = Date.now();
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO hunters (id, handle, email, skills, portfolio, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+      .bind(id, body.handle, body.email, body.skills || null, body.portfolio || null, createdAt)
+      .run();
+
+    return c.json({ received: true, id, createdAt });
+  } catch (err) {
+    console.error("D1 insert error:", err);
+    return c.json({ error: "保存に失敗しました" }, 500);
+  }
+});
+
+// ハンター一覧取得
+app.get("/hunters", async (c) => {
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT * FROM hunters ORDER BY created_at DESC`
+    ).all();
+    return c.json({ hunters: results });
+  } catch (err) {
+    console.error("D1 select error:", err);
+    return c.json({ error: "取得に失敗しました" }, 500);
+  }
+});
 export default app;
