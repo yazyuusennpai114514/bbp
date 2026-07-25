@@ -48,5 +48,17 @@ app.post("/programs", async (c) => {
     return c.json({ error: "保存に失敗しました" }, 500);
   }
 });
+// プログラム一覧を取得
+app.get("/programs", async (c) => {
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT * FROM programs ORDER BY created_at DESC`
+    ).all();
 
+    return c.json({ programs: results });
+  } catch (err) {
+    console.error("D1 select error:", err);
+    return c.json({ error: "取得に失敗しました" }, 500);
+  }
+});
 export default app;
