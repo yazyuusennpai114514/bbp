@@ -302,6 +302,87 @@ app.get("/programs", async (c) => {
   }
 });
 
+// プロフィール編集（本人のみ）
+app.patch("/programs/:id", async (c) => {
+  const id = c.req.param("id");
+  const user = await getSessionUser(c);
+  if (!user || user.userType !== "program" || user.userId !== id) {
+    return c.json({ error: "権限がありません。ログインし直してください" }, 403);
+  }
+
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json({ error: "リクエストが不正です" }, 400);
+
+  const companyName = body.companyName;
+  const scope = body.scope;
+  const description = body.description;
+  const rewardMin = Number(body.rewardMin) || 0;
+  const rewardMax = Number(body.rewardMax) || 0;
+
+  if (!companyName || !scope || !description) {
+    return c.json({ error: "必須項目が不足しています" }, 400);
+  }
+  if (rewardMin > rewardMax) {
+    return c.json({ error: "報奨金の下限は上限以下にしてください" }, 400);
+  }
+
+  try {
+    await c.env.DB.prepare(
+      `UPDATE programs SET company_name = ?, scope = ?, description = ?, reward_min = ?, reward_max = ? WHERE id = ?`
+    )
+      .bind(companyName, scope, description, rewardMin, rewardMax, id)
+      .run();
+    return c.json({ updated: true });
+  } catch (err) {
+    console.error("D1 update error:", err);
+    return c.json({ error: "更新に失敗しました" }, 500);
+  }
+});
+
+// プロフィール編集（本人のみ）
+app.patch("/programs/:id", async (c) => {
+  const id = c.req.param("id");
+  const user = await getSessionUser(c);
+  if (!user || user.userType !== "program" || user.userId !== id) {
+    return c.json({ error: "権限がありません。ログインし直してください" }, 403);
+  }
+
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json({ error: "リクエストが不正です" }, 400);
+
+  const companyName = body.companyName ?? null;
+  const scope = body.scope ?? null;
+  const description = body.description ?? null;
+  const rewardMin = body.rewardMin != null ? Number(body.rewardMin) : null;
+  const rewardMax = body.rewardMax != null ? Number(body.rewardMax) : null;
+
+  if (companyName === "" || scope === "" || description === "") {
+    return c.json({ error: "会社名・スコープ・説明は空にできません" }, 400);
+  }
+  if (rewardMin != null && rewardMax != null && rewardMin > rewardMax) {
+    return c.json({ error: "報奨金の下限は上限以下にしてください" }, 400);
+  }
+
+  try {
+    await c.env.DB.prepare(
+      `UPDATE programs SET
+         company_name = COALESCE(?, company_name),
+         scope = COALESCE(?, scope),
+         description = COALESCE(?, description),
+         reward_min = COALESCE(?, reward_min),
+         reward_max = COALESCE(?, reward_max)
+       WHERE id = ?`
+    )
+      .bind(companyName, scope, description, rewardMin, rewardMax, id)
+      .run();
+
+    return c.json({ updated: true });
+  } catch (err) {
+    console.error("D1 update error:", err);
+    return c.json({ error: "更新に失敗しました" }, 500);
+  }
+});
+
 app.post("/programs/:id/avatar", async (c) => {
   const id = c.req.param("id");
   const user = await getSessionUser(c);
@@ -397,6 +478,43 @@ app.get("/hunters", async (c) => {
   }
 });
 
+// プロフィール編集（本人のみ）
+app.patch("/hunters/:id", async (c) => {
+  const id = c.req.param("id");
+  const user = await getSessionUser(c);
+  if (!user || user.userType !== "hunter" || user.userId !== id) {
+    return c.json({ error: "権限がありません。ログインし直してください" }, 403);
+  }
+
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json({ error: "リクエストが不正です" }, 400);
+
+  const handle = body.handle ?? null;
+  const skills = body.skills ?? null;
+  const portfolio = body.portfolio ?? null;
+
+  if (handle === "") {
+    return c.json({ error: "ハンドルネームは空にできません" }, 400);
+  }
+
+  try {
+    await c.env.DB.prepare(
+      `UPDATE hunters SET
+         handle = COALESCE(?, handle),
+         skills = COALESCE(?, skills),
+         portfolio = COALESCE(?, portfolio)
+       WHERE id = ?`
+    )
+      .bind(handle, skills, portfolio, id)
+      .run();
+
+    return c.json({ updated: true });
+  } catch (err) {
+    console.error("D1 update error:", err);
+    return c.json({ error: "更新に失敗しました" }, 500);
+  }
+});
+
 app.post("/hunters/:id/avatar", async (c) => {
   const id = c.req.param("id");
   const user = await getSessionUser(c);
@@ -488,3 +606,4 @@ app.get("/programs/:id/reports", async (c) => {
 });
 
 export default app;
+
