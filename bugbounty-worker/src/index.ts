@@ -563,7 +563,13 @@ app.get("/avatars/:type/:id", async (c) => {
 // レポート
 // =====================================================
 
+// レポート提出（ハンターとしてログイン必須。誰が送ったかをhunter_idに記録する）
 app.post("/reports", async (c) => {
+  const user = await getSessionUser(c);
+  if (!user || user.userType !== "hunter") {
+    return c.json({ error: "レポートの提出にはハンターとしてログインが必要です" }, 401);
+  }
+
   const body = await c.req.json().catch(() => null);
 
   if (!body || !body.programId || !body.title || !body.severity || !body.description || !body.contactEmail) {
@@ -579,10 +585,10 @@ app.post("/reports", async (c) => {
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO reports (id, program_id, title, severity, description, poc, contact_email, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO reports (id, program_id, hunter_id, title, severity, description, poc, contact_email, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-      .bind(id, body.programId, body.title, body.severity, body.description, body.poc || null, body.contactEmail, "triage待ち", createdAt)
+      .bind(id, body.programId, user.userId, body.title, body.severity, body.description, body.poc || null, body.contactEmail, "triage待ち", createdAt)
       .run();
 
     return c.json({ received: true, id, createdAt });
@@ -605,5 +611,29 @@ app.get("/programs/:id/reports", async (c) => {
   }
 });
 
-export default app;
+// 自分（ハンター本人）が提出したレポート一覧
+app.get("/hunters/:id/reports", async (c) => {
+  const id = c.req.param("id");
+  const user = await getSessionUser(c);
+  if (!user || user.userType !== "hunter" || user.userId !== id) {
+    return c.json({ error: "権限がありません" }, 403);
+  }
 
+  try {
+    const { results } = await c.env.DB.prepare(
+      `SELECT r.*, p.company_name AS program_company_name
+       FROM reports r
+       JOIN programs p ON p.id = r.program_id
+       WHERE r.hunter_id = ?
+       ORDER BY r.created_at DESC`
+    )
+      .bind(id)
+      .all();
+    return c.json({ reports: results });
+  } catch (err) {
+    console.error("D1 select error:", err);
+    return c.json({ error: "取得に失敗しました" }, 500);
+  }
+});
+
+export default app;
