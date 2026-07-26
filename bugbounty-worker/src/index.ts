@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 type Bindings = {
   DB: D1Database;
   AVATARS: R2Bucket;
+  ADMIN_KEY: string;
 };
 
 type SessionUser = { userType: "hunter" | "program"; userId: string };
@@ -771,6 +772,63 @@ app.delete("/reports/:id", async (c) => {
     return c.json({ deleted: true });
   } catch (err) {
     console.error("D1 delete error:", err);
+    return c.json({ error: "削除に失敗しました" }, 500);
+  }
+});
+
+// =====================================================
+// 管理者用（別デプロイの管理画面から X-Admin-Key ヘッダーで呼ばれる）
+// =====================================================
+
+function requireAdmin(c: any): boolean {
+  const key = c.req.header("X-Admin-Key");
+  return !!key && !!c.env.ADMIN_KEY && key === c.env.ADMIN_KEY;
+}
+
+app.get("/admin/hunters", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, handle, email, avatar_key, totp_confirmed, created_at FROM hunters ORDER BY created_at DESC`
+  ).all();
+  return c.json({ hunters: results });
+});
+
+app.get("/admin/programs", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, company_name, contact_email, avatar_key, totp_confirmed, created_at FROM programs ORDER BY created_at DESC`
+  ).all();
+  return c.json({ programs: results });
+});
+
+app.delete("/admin/hunters/:id", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const id = c.req.param("id");
+  try {
+    await c.env.DB.prepare(`DELETE FROM report_comments WHERE author_type = 'hunter' AND author_id = ?`).bind(id).run();
+    await c.env.DB.prepare(`DELETE FROM reports WHERE hunter_id = ?`).bind(id).run();
+    await c.env.DB.prepare(`DELETE FROM sessions WHERE user_type = 'hunter' AND user_id = ?`).bind(id).run();
+    await c.env.DB.prepare(`DELETE FROM hunters WHERE id = ?`).bind(id).run();
+    return c.json({ deleted: true });
+  } catch (err) {
+    console.error("D1 admin delete error:", err);
+    return c.json({ error: "削除に失敗しました" }, 500);
+  }
+});
+
+app.delete("/admin/programs/:id", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const id = c.req.param("id");
+  try {
+    await c.env.DB.prepare(
+      `DELETE FROM report_comments WHERE report_id IN (SELECT id FROM reports WHERE program_id = ?)`
+    ).bind(id).run();
+    await c.env.DB.prepare(`DELETE FROM reports WHERE program_id = ?`).bind(id).run();
+    await c.env.DB.prepare(`DELETE FROM sessions WHERE user_type = 'program' AND user_id = ?`).bind(id).run();
+    await c.env.DB.prepare(`DELETE FROM programs WHERE id = ?`).bind(id).run();
+    return c.json({ deleted: true });
+  } catch (err) {
+    console.error("D1 admin delete error:", err);
     return c.json({ error: "削除に失敗しました" }, 500);
   }
 });
