@@ -5,6 +5,7 @@ type Bindings = {
   DB: D1Database;
   AVATARS: R2Bucket;
   ADMIN_KEY: string;
+  PLATFORM_PAYPAL_LINK: string;
 };
 
 type SessionUser = { userType: "hunter" | "program"; userId: string };
@@ -148,6 +149,11 @@ const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 const ALLOWED_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 app.get("/", (c) => c.json({ status: "ok", message: "BBP API is running" }));
+
+// 企業側に見せる、プラットフォームの送金先と手数料率（公開情報）
+app.get("/platform-info", (c) => {
+  return c.json({ paypalLink: c.env.PLATFORM_PAYPAL_LINK || null, feePercent: 10 });
+});
 
 // =====================================================
 // 認証
@@ -664,10 +670,9 @@ app.get("/reports/:id", async (c) => {
   if (!user) return c.json({ error: "権限がありません" }, 403);
 
   const program = await c.env.DB.prepare(`SELECT id, company_name FROM programs WHERE id = ?`).bind(report.program_id).first();
-  // PayPal受け取り先は、報奨金の支払い先を確認する必要がある企業側にだけ返す
-  const hunterCols = user.userType === "program" ? "id, handle, paypal_link" : "id, handle";
+  // 支払いはプラットフォーム経由になったため、企業にハンターのPayPal先は返さない
   const hunter = report.hunter_id
-    ? await c.env.DB.prepare(`SELECT ${hunterCols} FROM hunters WHERE id = ?`).bind(report.hunter_id).first()
+    ? await c.env.DB.prepare(`SELECT id, handle FROM hunters WHERE id = ?`).bind(report.hunter_id).first()
     : null;
 
   return c.json({ report, program, hunter });
@@ -754,14 +759,7 @@ app.patch("/reports/:id", async (c) => {
     fields.push("reward_amount = ?");
     values.push(body.rewardAmount === null ? null : Number(body.rewardAmount));
   }
-  if (body.rewardPaid !== undefined) {
-    fields.push("reward_paid = ?");
-    values.push(body.rewardPaid ? 1 : 0);
-  }
-  if (body.paymentNote !== undefined) {
-    fields.push("payment_note = ?");
-    values.push(body.paymentNote);
-  }
+  // reward_paid / payment_note は運営者(管理画面)側だけが更新できる。企業側からは変更不可。
 
   if (fields.length === 0) {
     return c.json({ error: "更新項目がありません" }, 400);
@@ -809,7 +807,7 @@ function requireAdmin(c: any): boolean {
 app.get("/admin/hunters", async (c) => {
   if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
   const { results } = await c.env.DB.prepare(
-    `SELECT id, handle, email, avatar_key, totp_confirmed, created_at FROM hunters ORDER BY created_at DESC`
+    `SELECT id, handle, email, paypal_link, avatar_key, totp_confirmed, created_at FROM hunters ORDER BY created_at DESC`
   ).all();
   return c.json({ hunters: results });
 });
@@ -851,6 +849,95 @@ app.delete("/admin/programs/:id", async (c) => {
   } catch (err) {
     console.error("D1 admin delete error:", err);
     return c.json({ error: "削除に失敗しました" }, 500);
+  }
+});
+
+// 報奨金が設定されているレポート一覧（送金先のPayPalリンク付き）
+app.get("/admin/reports", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const { results } = await c.env.DB.prepare(
+    `SELECT r.id, r.title, r.status, r.reward_amount, r.reward_paid, r.payment_note, r.created_at,
+            p.company_name AS program_company_name,
+            h.handle AS hunter_handle, h.paypal_link AS hunter_paypal_link
+     FROM reports r
+     JOIN programs p ON p.id = r.program_id
+     LEFT JOIN hunters h ON h.id = r.hunter_id
+     WHERE r.reward_amount IS NOT NULL
+     ORDER BY r.reward_paid ASC, r.created_at DESC`
+  ).all();
+  return c.json({ reports: results });
+});
+
+// 支払い済みフラグ・メモの更新（運営者のみ）
+app.patch("/admin/reports/:id", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json({ error: "リクエストが不正です" }, 400);
+
+  const fields: string[] = [];
+  const values: any[] = [];
+  if (body.rewardPaid !== undefined) {
+    fields.push("reward_paid = ?");
+    values.push(body.rewardPaid ? 1 : 0);
+  }
+  if (body.paymentNote !== undefined) {
+    fields.push("payment_note = ?");
+    values.push(body.paymentNote);
+  }
+  if (fields.length === 0) return c.json({ error: "更新項目がありません" }, 400);
+
+  try {
+    await c.env.DB.prepare(`UPDATE reports SET ${fields.join(", ")} WHERE id = ?`)
+      .bind(...values, id)
+      .run();
+    return c.json({ updated: true });
+  } catch (err) {
+    console.error("D1 admin update error:", err);
+    return c.json({ error: "更新に失敗しました" }, 500);
+  }
+});
+
+// プラットフォーム手数料（企業からの入金額に対する割合）
+const PLATFORM_FEE_RATE = 0.1;
+
+// 支払い待ちのレポート一覧（報奨金が設定済み・未払いのもの全件、企業横断）
+app.get("/admin/reports/unpaid", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const { results } = await c.env.DB.prepare(
+    `SELECT r.id, r.title, r.reward_amount, r.status, r.created_at,
+            p.company_name AS program_company_name,
+            h.id AS hunter_id, h.handle AS hunter_handle, h.paypal_link AS hunter_paypal_link
+     FROM reports r
+     JOIN programs p ON p.id = r.program_id
+     LEFT JOIN hunters h ON h.id = r.hunter_id
+     WHERE r.reward_amount IS NOT NULL AND r.reward_paid = 0
+     ORDER BY r.created_at ASC`
+  ).all();
+
+  const withFees = (results as any[]).map((r) => {
+    const gross = Number(r.reward_amount) || 0;
+    const fee = Math.round(gross * PLATFORM_FEE_RATE);
+    return { ...r, gross_amount: gross, platform_fee: fee, net_amount: gross - fee };
+  });
+
+  return c.json({ reports: withFees, feeRate: PLATFORM_FEE_RATE });
+});
+
+// 運営者がハンターへの送金を終えたら、支払い済みにする
+app.patch("/admin/reports/:id/paid", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => ({}));
+
+  try {
+    await c.env.DB.prepare(`UPDATE reports SET reward_paid = 1, payment_note = COALESCE(?, payment_note) WHERE id = ?`)
+      .bind(body?.paymentNote ?? null, id)
+      .run();
+    return c.json({ updated: true });
+  } catch (err) {
+    console.error("D1 update error:", err);
+    return c.json({ error: "更新に失敗しました" }, 500);
   }
 });
 
