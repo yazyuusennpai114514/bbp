@@ -6,6 +6,7 @@ type Bindings = {
   AVATARS: R2Bucket;
   ADMIN_KEY: string;
   PLATFORM_PAYPAL_LINK: string;
+  RESEND_API_KEY: string;
 };
 
 type SessionUser = { userType: "hunter" | "program"; userId: string };
@@ -119,6 +120,43 @@ async function consumeBackupCode(hashedCodes: string[], inputCode: string): Prom
 }
 
 // =====================================================
+// メールアドレス確認（数字コード送信）
+// =====================================================
+
+const EMAIL_CODE_DURATION_MS = 15 * 60 * 1000; // 15分
+
+function generateEmailCode(): string {
+  const n = crypto.getRandomValues(new Uint32Array(1))[0] % 1000000;
+  return String(n).padStart(6, "0");
+}
+
+async function sendVerificationEmail(apiKey: string, to: string, code: string): Promise<boolean> {
+  if (!apiKey) {
+    console.error("RESEND_API_KEY is not set; skipping email send");
+    return false;
+  }
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: "bughunter.uk <no-reply@bughunter.uk>",
+        to: [to],
+        subject: `【bughunter.uk】確認コード: ${code}`,
+        text: `以下の確認コードをサイトに入力してください。\n\n確認コード: ${code}\n\nこのコードの有効期限は15分です。心当たりがない場合はこのメールを無視してください。`,
+      }),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error("Resend send error:", err);
+    return false;
+  }
+}
+
+// =====================================================
 // セッション
 // =====================================================
 
@@ -190,8 +228,8 @@ app.post("/auth/login", async (c) => {
   const emailCol = body.userType === "hunter" ? "email" : "contact_email";
 
   const row: any = await c.env.DB.prepare(`SELECT * FROM ${table} WHERE ${emailCol} = ?`).bind(body.email).first();
-  if (!row || !row.totp_confirmed) {
-    return c.json({ error: "メールアドレスが未登録か、認証アプリの設定が完了していません" }, 401);
+  if (!row || !row.totp_confirmed || !row.email_verified) {
+    return c.json({ error: "メールアドレスが未登録か、認証アプリ・メール確認の設定が完了していません" }, 401);
   }
 
   const isTotpValid = await verifyTotp(row.totp_secret, body.code);
@@ -264,11 +302,14 @@ app.post("/programs", async (c) => {
   const secret = generateTotpSecret();
   const backupCodes = generateBackupCodes();
   const hashedBackupCodes = await Promise.all(backupCodes.map(hashCode));
+  const emailCode = generateEmailCode();
+  const emailCodeHash = await hashCode(emailCode);
+  const emailCodeExpires = Date.now() + EMAIL_CODE_DURATION_MS;
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO programs (id, company_name, contact_email, scope, description, reward_min, reward_max, totp_secret, totp_confirmed, backup_codes, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`
+      `INSERT INTO programs (id, company_name, contact_email, scope, description, reward_min, reward_max, totp_secret, totp_confirmed, backup_codes, email_verified, email_code, email_code_expires, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?)`
     )
       .bind(
         id,
@@ -280,12 +321,15 @@ app.post("/programs", async (c) => {
         Number(body.rewardMax) || 0,
         secret,
         JSON.stringify(hashedBackupCodes),
+        emailCodeHash,
+        emailCodeExpires,
         createdAt
       )
       .run();
 
+    const emailSent = await sendVerificationEmail(c.env.RESEND_API_KEY, body.contactEmail, emailCode);
     const otpauthUrl = `otpauth://totp/BBP:${encodeURIComponent(body.contactEmail)}?secret=${secret}&issuer=BBP&algorithm=SHA1&digits=6&period=30`;
-    return c.json({ received: true, id, createdAt, secret, otpauthUrl, backupCodes });
+    return c.json({ received: true, id, createdAt, secret, otpauthUrl, backupCodes, emailSent });
   } catch (err: any) {
     if (String(err?.message || "").includes("UNIQUE")) {
       return c.json({ error: "このメールアドレスは既に登録されています" }, 409);
@@ -293,6 +337,49 @@ app.post("/programs", async (c) => {
     console.error("D1 insert error:", err);
     return c.json({ error: "保存に失敗しました" }, 500);
   }
+});
+
+// メール認証コードの確認
+app.post("/programs/:id/confirm-email", async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => null);
+  if (!body || !body.code) return c.json({ error: "コードを入力してください" }, 400);
+
+  const row: any = await c.env.DB.prepare(`SELECT * FROM programs WHERE id = ?`).bind(id).first();
+  if (!row) return c.json({ error: "not found" }, 404);
+  if (row.email_verified) return c.json({ error: "すでに確認済みです" }, 400);
+  if (!row.email_code_expires || row.email_code_expires < Date.now()) {
+    return c.json({ error: "コードの有効期限が切れています。再送信してください" }, 401);
+  }
+
+  const inputHash = await hashCode(body.code);
+  if (inputHash !== row.email_code) {
+    return c.json({ error: "コードが正しくありません" }, 401);
+  }
+
+  await c.env.DB.prepare(`UPDATE programs SET email_verified = 1, email_code = NULL, email_code_expires = NULL WHERE id = ?`)
+    .bind(id)
+    .run();
+  return c.json({ confirmed: true });
+});
+
+// メール認証コードの再送信
+app.post("/programs/:id/resend-email-code", async (c) => {
+  const id = c.req.param("id");
+  const row: any = await c.env.DB.prepare(`SELECT * FROM programs WHERE id = ?`).bind(id).first();
+  if (!row) return c.json({ error: "not found" }, 404);
+  if (row.email_verified) return c.json({ error: "すでに確認済みです" }, 400);
+
+  const emailCode = generateEmailCode();
+  const emailCodeHash = await hashCode(emailCode);
+  const emailCodeExpires = Date.now() + EMAIL_CODE_DURATION_MS;
+
+  await c.env.DB.prepare(`UPDATE programs SET email_code = ?, email_code_expires = ? WHERE id = ?`)
+    .bind(emailCodeHash, emailCodeExpires, id)
+    .run();
+
+  const emailSent = await sendVerificationEmail(c.env.RESEND_API_KEY, row.contact_email, emailCode);
+  return c.json({ sent: emailSent });
 });
 
 // 登録直後、認証アプリに表示された6桁コードを入力して紐付けを確定させる
@@ -303,6 +390,7 @@ app.post("/programs/:id/confirm-totp", async (c) => {
 
   const row: any = await c.env.DB.prepare(`SELECT * FROM programs WHERE id = ?`).bind(id).first();
   if (!row) return c.json({ error: "not found" }, 404);
+  if (!row.email_verified) return c.json({ error: "先にメールアドレスの確認を完了してください" }, 400);
   if (row.totp_confirmed) return c.json({ error: "すでに確認済みです" }, 400);
 
   const ok = await verifyTotp(row.totp_secret, body.code);
@@ -317,7 +405,7 @@ app.get("/programs", async (c) => {
   try {
     const { results } = await c.env.DB.prepare(
       `SELECT id, company_name, contact_email, scope, description, reward_min, reward_max, avatar_key, created_at
-       FROM programs WHERE totp_confirmed = 1 ORDER BY created_at DESC`
+       FROM programs WHERE totp_confirmed = 1 AND email_verified = 1 ORDER BY created_at DESC`
     ).all();
     return c.json({ programs: results });
   } catch (err) {
@@ -452,17 +540,32 @@ app.post("/hunters", async (c) => {
   const secret = generateTotpSecret();
   const backupCodes = generateBackupCodes();
   const hashedBackupCodes = await Promise.all(backupCodes.map(hashCode));
+  const emailCode = generateEmailCode();
+  const emailCodeHash = await hashCode(emailCode);
+  const emailCodeExpires = Date.now() + EMAIL_CODE_DURATION_MS;
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO hunters (id, handle, email, skills, portfolio, totp_secret, totp_confirmed, backup_codes, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`
+      `INSERT INTO hunters (id, handle, email, skills, portfolio, totp_secret, totp_confirmed, backup_codes, email_verified, email_code, email_code_expires, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?)`
     )
-      .bind(id, body.handle, body.email, body.skills || null, body.portfolio || null, secret, JSON.stringify(hashedBackupCodes), createdAt)
+      .bind(
+        id,
+        body.handle,
+        body.email,
+        body.skills || null,
+        body.portfolio || null,
+        secret,
+        JSON.stringify(hashedBackupCodes),
+        emailCodeHash,
+        emailCodeExpires,
+        createdAt
+      )
       .run();
 
+    const emailSent = await sendVerificationEmail(c.env.RESEND_API_KEY, body.email, emailCode);
     const otpauthUrl = `otpauth://totp/BBP:${encodeURIComponent(body.email)}?secret=${secret}&issuer=BBP&algorithm=SHA1&digits=6&period=30`;
-    return c.json({ received: true, id, createdAt, secret, otpauthUrl, backupCodes });
+    return c.json({ received: true, id, createdAt, secret, otpauthUrl, backupCodes, emailSent });
   } catch (err: any) {
     if (String(err?.message || "").includes("UNIQUE")) {
       return c.json({ error: "このメールアドレスは既に登録されています" }, 409);
@@ -472,6 +575,49 @@ app.post("/hunters", async (c) => {
   }
 });
 
+// メール認証コードの確認
+app.post("/hunters/:id/confirm-email", async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => null);
+  if (!body || !body.code) return c.json({ error: "コードを入力してください" }, 400);
+
+  const row: any = await c.env.DB.prepare(`SELECT * FROM hunters WHERE id = ?`).bind(id).first();
+  if (!row) return c.json({ error: "not found" }, 404);
+  if (row.email_verified) return c.json({ error: "すでに確認済みです" }, 400);
+  if (!row.email_code_expires || row.email_code_expires < Date.now()) {
+    return c.json({ error: "コードの有効期限が切れています。再送信してください" }, 401);
+  }
+
+  const inputHash = await hashCode(body.code);
+  if (inputHash !== row.email_code) {
+    return c.json({ error: "コードが正しくありません" }, 401);
+  }
+
+  await c.env.DB.prepare(`UPDATE hunters SET email_verified = 1, email_code = NULL, email_code_expires = NULL WHERE id = ?`)
+    .bind(id)
+    .run();
+  return c.json({ confirmed: true });
+});
+
+// メール認証コードの再送信
+app.post("/hunters/:id/resend-email-code", async (c) => {
+  const id = c.req.param("id");
+  const row: any = await c.env.DB.prepare(`SELECT * FROM hunters WHERE id = ?`).bind(id).first();
+  if (!row) return c.json({ error: "not found" }, 404);
+  if (row.email_verified) return c.json({ error: "すでに確認済みです" }, 400);
+
+  const emailCode = generateEmailCode();
+  const emailCodeHash = await hashCode(emailCode);
+  const emailCodeExpires = Date.now() + EMAIL_CODE_DURATION_MS;
+
+  await c.env.DB.prepare(`UPDATE hunters SET email_code = ?, email_code_expires = ? WHERE id = ?`)
+    .bind(emailCodeHash, emailCodeExpires, id)
+    .run();
+
+  const emailSent = await sendVerificationEmail(c.env.RESEND_API_KEY, row.email, emailCode);
+  return c.json({ sent: emailSent });
+});
+
 app.post("/hunters/:id/confirm-totp", async (c) => {
   const id = c.req.param("id");
   const body = await c.req.json().catch(() => null);
@@ -479,6 +625,7 @@ app.post("/hunters/:id/confirm-totp", async (c) => {
 
   const row: any = await c.env.DB.prepare(`SELECT * FROM hunters WHERE id = ?`).bind(id).first();
   if (!row) return c.json({ error: "not found" }, 404);
+  if (!row.email_verified) return c.json({ error: "先にメールアドレスの確認を完了してください" }, 400);
   if (row.totp_confirmed) return c.json({ error: "すでに確認済みです" }, 400);
 
   const ok = await verifyTotp(row.totp_secret, body.code);
@@ -493,7 +640,7 @@ app.get("/hunters", async (c) => {
   try {
     const { results } = await c.env.DB.prepare(
       `SELECT id, handle, email, skills, portfolio, avatar_key, created_at
-       FROM hunters WHERE totp_confirmed = 1 ORDER BY created_at DESC`
+       FROM hunters WHERE totp_confirmed = 1 AND email_verified = 1 ORDER BY created_at DESC`
     ).all();
     return c.json({ hunters: results });
   } catch (err) {
