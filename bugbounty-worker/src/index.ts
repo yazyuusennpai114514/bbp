@@ -150,9 +150,21 @@ const ALLOWED_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 app.get("/", (c) => c.json({ status: "ok", message: "BBP API is running" }));
 
+// プラットフォーム設定（PayPal送金先・手数料率）をD1から読む。未設定なら環境変数/デフォルト値にフォールバック
+async function getPlatformSettings(db: D1Database, envFallbackLink?: string) {
+  const rows = await db.prepare(`SELECT key, value FROM platform_settings WHERE key IN ('paypal_link', 'fee_percent')`).all();
+  const map: Record<string, string> = {};
+  for (const row of rows.results as any[]) map[row.key] = row.value;
+
+  const paypalLink = map.paypal_link ?? envFallbackLink ?? null;
+  const feePercent = map.fee_percent != null ? Number(map.fee_percent) : 10;
+  return { paypalLink, feePercent };
+}
+
 // 企業側に見せる、プラットフォームの送金先と手数料率（公開情報）
-app.get("/platform-info", (c) => {
-  return c.json({ paypalLink: c.env.PLATFORM_PAYPAL_LINK || null, feePercent: 10 });
+app.get("/platform-info", async (c) => {
+  const settings = await getPlatformSettings(c.env.DB, c.env.PLATFORM_PAYPAL_LINK);
+  return c.json(settings);
 });
 
 // =====================================================
@@ -898,12 +910,12 @@ app.patch("/admin/reports/:id", async (c) => {
   }
 });
 
-// プラットフォーム手数料（企業からの入金額に対する割合）
-const PLATFORM_FEE_RATE = 0.1;
-
 // 支払い待ちのレポート一覧（報奨金が設定済み・未払いのもの全件、企業横断）
 app.get("/admin/reports/unpaid", async (c) => {
   if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const settings = await getPlatformSettings(c.env.DB, c.env.PLATFORM_PAYPAL_LINK);
+  const feeRate = settings.feePercent / 100;
+
   const { results } = await c.env.DB.prepare(
     `SELECT r.id, r.title, r.reward_amount, r.status, r.created_at,
             p.company_name AS program_company_name,
@@ -917,7 +929,7 @@ app.get("/admin/reports/unpaid", async (c) => {
 
   const withFees = (results as any[]).map((r) => {
     const gross = Number(r.reward_amount) || 0;
-    const fee = Math.round(gross * PLATFORM_FEE_RATE);
+    const fee = Math.round(gross * feeRate);
     return { ...r, gross_amount: gross, platform_fee: fee, net_amount: gross - fee };
   });
 
@@ -934,6 +946,43 @@ app.patch("/admin/reports/:id/paid", async (c) => {
     await c.env.DB.prepare(`UPDATE reports SET reward_paid = 1, payment_note = COALESCE(?, payment_note) WHERE id = ?`)
       .bind(body?.paymentNote ?? null, id)
       .run();
+    return c.json({ updated: true });
+  } catch (err) {
+    console.error("D1 update error:", err);
+    return c.json({ error: "更新に失敗しました" }, 500);
+  }
+});
+
+// プラットフォーム設定の確認・変更（PayPal送金先・手数料率）
+app.get("/admin/settings", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const settings = await getPlatformSettings(c.env.DB, c.env.PLATFORM_PAYPAL_LINK);
+  return c.json(settings);
+});
+
+app.patch("/admin/settings", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json({ error: "リクエストが不正です" }, 400);
+
+  if (body.feePercent !== undefined) {
+    const fp = Number(body.feePercent);
+    if (isNaN(fp) || fp < 0 || fp > 100) return c.json({ error: "手数料率は0〜100の数値にしてください" }, 400);
+  }
+
+  try {
+    if (body.paypalLink !== undefined) {
+      await c.env.DB.prepare(
+        `INSERT INTO platform_settings (key, value) VALUES ('paypal_link', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+      ).bind(body.paypalLink).run();
+    }
+    if (body.feePercent !== undefined) {
+      await c.env.DB.prepare(
+        `INSERT INTO platform_settings (key, value) VALUES ('fee_percent', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+      ).bind(String(body.feePercent)).run();
+    }
     return c.json({ updated: true });
   } catch (err) {
     console.error("D1 update error:", err);
