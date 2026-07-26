@@ -717,4 +717,62 @@ app.post("/reports/:id/comments", async (c) => {
   }
 });
 
+const VALID_STATUSES = ["トリアージ", "返信待ち", "info", "解決済み", "スパム", "N/A", "閉鎖"];
+
+// ステータス変更・報奨金の付与（宛先企業のみ）
+app.patch("/reports/:id", async (c) => {
+  const id = c.req.param("id");
+  const { report, user } = await getAuthorizedReport(c, id);
+  if (!report) return c.json({ error: "not found" }, 404);
+  if (!user || user.userType !== "program") {
+    return c.json({ error: "権限がありません。企業アカウントでログインしてください" }, 403);
+  }
+
+  const body = await c.req.json().catch(() => null);
+  if (!body) return c.json({ error: "リクエストが不正です" }, 400);
+
+  if (body.status !== undefined && !VALID_STATUSES.includes(body.status)) {
+    return c.json({ error: "ステータスの値が不正です" }, 400);
+  }
+  if (body.rewardAmount !== undefined && body.rewardAmount !== null && Number(body.rewardAmount) < 0) {
+    return c.json({ error: "報奨金額は0以上にしてください" }, 400);
+  }
+
+  const status = body.status !== undefined ? body.status : null;
+  const rewardAmount = body.rewardAmount !== undefined ? (body.rewardAmount === null ? null : Number(body.rewardAmount)) : undefined;
+
+  try {
+    if (rewardAmount !== undefined) {
+      await c.env.DB.prepare(`UPDATE reports SET status = COALESCE(?, status), reward_amount = ? WHERE id = ?`)
+        .bind(status, rewardAmount, id)
+        .run();
+    } else {
+      await c.env.DB.prepare(`UPDATE reports SET status = COALESCE(?, status) WHERE id = ?`).bind(status, id).run();
+    }
+    return c.json({ updated: true });
+  } catch (err) {
+    console.error("D1 update error:", err);
+    return c.json({ error: "更新に失敗しました" }, 500);
+  }
+});
+
+// レポート削除（宛先企業のみ）
+app.delete("/reports/:id", async (c) => {
+  const id = c.req.param("id");
+  const { report, user } = await getAuthorizedReport(c, id);
+  if (!report) return c.json({ error: "not found" }, 404);
+  if (!user || user.userType !== "program") {
+    return c.json({ error: "権限がありません。企業アカウントでログインしてください" }, 403);
+  }
+
+  try {
+    await c.env.DB.prepare(`DELETE FROM report_comments WHERE report_id = ?`).bind(id).run();
+    await c.env.DB.prepare(`DELETE FROM reports WHERE id = ?`).bind(id).run();
+    return c.json({ deleted: true });
+  } catch (err) {
+    console.error("D1 delete error:", err);
+    return c.json({ error: "削除に失敗しました" }, 500);
+  }
+});
+
 export default app;
