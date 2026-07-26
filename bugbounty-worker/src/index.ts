@@ -203,7 +203,7 @@ app.get("/auth/me", async (c) => {
   const table = user.userType === "hunter" ? "hunters" : "programs";
   const cols =
     user.userType === "hunter"
-      ? "id, handle, email, skills, portfolio, avatar_key, created_at"
+      ? "id, handle, email, skills, portfolio, paypal_link, avatar_key, created_at"
       : "id, company_name, contact_email, scope, description, reward_min, reward_max, avatar_key, created_at";
 
   const row = await c.env.DB.prepare(`SELECT ${cols} FROM ${table} WHERE id = ?`).bind(user.userId).first();
@@ -493,6 +493,7 @@ app.patch("/hunters/:id", async (c) => {
   const handle = body.handle ?? null;
   const skills = body.skills ?? null;
   const portfolio = body.portfolio ?? null;
+  const paypalLink = body.paypalLink ?? null;
 
   if (handle === "") {
     return c.json({ error: "ハンドルネームは空にできません" }, 400);
@@ -503,10 +504,11 @@ app.patch("/hunters/:id", async (c) => {
       `UPDATE hunters SET
          handle = COALESCE(?, handle),
          skills = COALESCE(?, skills),
-         portfolio = COALESCE(?, portfolio)
+         portfolio = COALESCE(?, portfolio),
+         paypal_link = COALESCE(?, paypal_link)
        WHERE id = ?`
     )
-      .bind(handle, skills, portfolio, id)
+      .bind(handle, skills, portfolio, paypalLink, id)
       .run();
 
     return c.json({ updated: true });
@@ -662,8 +664,10 @@ app.get("/reports/:id", async (c) => {
   if (!user) return c.json({ error: "権限がありません" }, 403);
 
   const program = await c.env.DB.prepare(`SELECT id, company_name FROM programs WHERE id = ?`).bind(report.program_id).first();
+  // PayPal受け取り先は、報奨金の支払い先を確認する必要がある企業側にだけ返す
+  const hunterCols = user.userType === "program" ? "id, handle, paypal_link" : "id, handle";
   const hunter = report.hunter_id
-    ? await c.env.DB.prepare(`SELECT id, handle FROM hunters WHERE id = ?`).bind(report.hunter_id).first()
+    ? await c.env.DB.prepare(`SELECT ${hunterCols} FROM hunters WHERE id = ?`).bind(report.hunter_id).first()
     : null;
 
   return c.json({ report, program, hunter });
@@ -720,7 +724,7 @@ app.post("/reports/:id/comments", async (c) => {
 
 const VALID_STATUSES = ["トリアージ", "返信待ち", "info", "解決済み", "スパム", "N/A", "閉鎖"];
 
-// ステータス変更・報奨金の付与（宛先企業のみ）
+// ステータス変更・報奨金の付与・支払い状況の更新（宛先企業のみ）
 app.patch("/reports/:id", async (c) => {
   const id = c.req.param("id");
   const { report, user } = await getAuthorizedReport(c, id);
@@ -739,17 +743,34 @@ app.patch("/reports/:id", async (c) => {
     return c.json({ error: "報奨金額は0以上にしてください" }, 400);
   }
 
-  const status = body.status !== undefined ? body.status : null;
-  const rewardAmount = body.rewardAmount !== undefined ? (body.rewardAmount === null ? null : Number(body.rewardAmount)) : undefined;
+  const fields: string[] = [];
+  const values: any[] = [];
+
+  if (body.status !== undefined) {
+    fields.push("status = ?");
+    values.push(body.status);
+  }
+  if (body.rewardAmount !== undefined) {
+    fields.push("reward_amount = ?");
+    values.push(body.rewardAmount === null ? null : Number(body.rewardAmount));
+  }
+  if (body.rewardPaid !== undefined) {
+    fields.push("reward_paid = ?");
+    values.push(body.rewardPaid ? 1 : 0);
+  }
+  if (body.paymentNote !== undefined) {
+    fields.push("payment_note = ?");
+    values.push(body.paymentNote);
+  }
+
+  if (fields.length === 0) {
+    return c.json({ error: "更新項目がありません" }, 400);
+  }
 
   try {
-    if (rewardAmount !== undefined) {
-      await c.env.DB.prepare(`UPDATE reports SET status = COALESCE(?, status), reward_amount = ? WHERE id = ?`)
-        .bind(status, rewardAmount, id)
-        .run();
-    } else {
-      await c.env.DB.prepare(`UPDATE reports SET status = COALESCE(?, status) WHERE id = ?`).bind(status, id).run();
-    }
+    await c.env.DB.prepare(`UPDATE reports SET ${fields.join(", ")} WHERE id = ?`)
+      .bind(...values, id)
+      .run();
     return c.json({ updated: true });
   } catch (err) {
     console.error("D1 update error:", err);
