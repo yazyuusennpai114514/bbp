@@ -150,15 +150,20 @@ const ALLOWED_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 app.get("/", (c) => c.json({ status: "ok", message: "BBP API is running" }));
 
-// プラットフォーム設定（PayPal送金先・手数料率）をD1から読む。未設定なら環境変数/デフォルト値にフォールバック
+// プラットフォーム設定（PayPal送金先・手数料率）をD1から読む。未設定・テーブル未作成ならフォールバック
 async function getPlatformSettings(db: D1Database, envFallbackLink?: string) {
-  const rows = await db.prepare(`SELECT key, value FROM platform_settings WHERE key IN ('paypal_link', 'fee_percent')`).all();
-  const map: Record<string, string> = {};
-  for (const row of rows.results as any[]) map[row.key] = row.value;
+  try {
+    const rows = await db.prepare(`SELECT key, value FROM platform_settings WHERE key IN ('paypal_link', 'fee_percent')`).all();
+    const map: Record<string, string> = {};
+    for (const row of rows.results as any[]) map[row.key] = row.value;
 
-  const paypalLink = map.paypal_link ?? envFallbackLink ?? null;
-  const feePercent = map.fee_percent != null ? Number(map.fee_percent) : 10;
-  return { paypalLink, feePercent };
+    const paypalLink = map.paypal_link ?? envFallbackLink ?? null;
+    const feePercent = map.fee_percent != null ? Number(map.fee_percent) : 10;
+    return { paypalLink, feePercent };
+  } catch (err) {
+    console.error("platform_settings read error (table may not exist yet):", err);
+    return { paypalLink: envFallbackLink ?? null, feePercent: 10 };
+  }
 }
 
 // 企業側に見せる、プラットフォームの送金先と手数料率（公開情報）
