@@ -918,27 +918,32 @@ app.patch("/admin/reports/:id", async (c) => {
 // 支払い待ちのレポート一覧（報奨金が設定済み・未払いのもの全件、企業横断）
 app.get("/admin/reports/unpaid", async (c) => {
   if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
-  const settings = await getPlatformSettings(c.env.DB, c.env.PLATFORM_PAYPAL_LINK);
-  const feeRate = settings.feePercent / 100;
+  try {
+    const settings = await getPlatformSettings(c.env.DB, c.env.PLATFORM_PAYPAL_LINK);
+    const feeRate = settings.feePercent / 100;
 
-  const { results } = await c.env.DB.prepare(
-    `SELECT r.id, r.title, r.reward_amount, r.status, r.created_at,
-            p.company_name AS program_company_name,
-            h.id AS hunter_id, h.handle AS hunter_handle, h.paypal_link AS hunter_paypal_link
-     FROM reports r
-     JOIN programs p ON p.id = r.program_id
-     LEFT JOIN hunters h ON h.id = r.hunter_id
-     WHERE r.reward_amount IS NOT NULL AND r.reward_paid = 0
-     ORDER BY r.created_at ASC`
-  ).all();
+    const { results } = await c.env.DB.prepare(
+      `SELECT r.id, r.title, r.reward_amount, r.status, r.created_at,
+              p.company_name AS program_company_name,
+              h.id AS hunter_id, h.handle AS hunter_handle, h.paypal_link AS hunter_paypal_link
+       FROM reports r
+       JOIN programs p ON p.id = r.program_id
+       LEFT JOIN hunters h ON h.id = r.hunter_id
+       WHERE r.reward_amount IS NOT NULL AND r.reward_paid = 0
+       ORDER BY r.created_at ASC`
+    ).all();
 
-  const withFees = (results as any[]).map((r) => {
-    const gross = Number(r.reward_amount) || 0;
-    const fee = Math.round(gross * feeRate);
-    return { ...r, gross_amount: gross, platform_fee: fee, net_amount: gross - fee };
-  });
+    const withFees = (results as any[]).map((r) => {
+      const gross = Number(r.reward_amount) || 0;
+      const fee = Math.round(gross * feeRate);
+      return { ...r, gross_amount: gross, platform_fee: fee, net_amount: gross - fee };
+    });
 
-  return c.json({ reports: withFees, feeRate: PLATFORM_FEE_RATE });
+    return c.json({ reports: withFees, feeRate });
+  } catch (err) {
+    console.error("D1 select error:", err);
+    return c.json({ error: "取得に失敗しました" }, 500);
+  }
 });
 
 // 運営者がハンターへの送金を終えたら、支払い済みにする
