@@ -200,16 +200,17 @@ app.get("/", (c) => c.json({ status: "ok", message: "BBP API is running" }));
 // プラットフォーム設定（PayPal送金先・手数料率）をD1から読む。未設定・テーブル未作成ならフォールバック
 async function getPlatformSettings(db: D1Database, envFallbackLink?: string) {
   try {
-    const rows = await db.prepare(`SELECT key, value FROM platform_settings WHERE key IN ('paypal_link', 'fee_percent')`).all();
+    const rows = await db.prepare(`SELECT key, value FROM platform_settings WHERE key IN ('paypal_link', 'fee_percent', 'admin_email')`).all();
     const map: Record<string, string> = {};
     for (const row of rows.results as any[]) map[row.key] = row.value;
 
     const paypalLink = map.paypal_link ?? envFallbackLink ?? null;
     const feePercent = map.fee_percent != null ? Number(map.fee_percent) : 10;
-    return { paypalLink, feePercent };
+    const adminEmail = map.admin_email ?? null;
+    return { paypalLink, feePercent, adminEmail };
   } catch (err) {
     console.error("platform_settings read error (table may not exist yet):", err);
-    return { paypalLink: envFallbackLink ?? null, feePercent: 10 };
+    return { paypalLink: envFallbackLink ?? null, feePercent: 10, adminEmail: null };
   }
 }
 
@@ -839,6 +840,83 @@ app.get("/hunters/:id/reports", async (c) => {
   }
 });
 
+const PAYOUT_REQUEST_THRESHOLD = 5000;
+
+async function getHunterPendingTotal(db: D1Database, hunterId: string, feePercent: number) {
+  const { results } = await db
+    .prepare(`SELECT reward_amount FROM reports WHERE hunter_id = ? AND reward_amount IS NOT NULL AND reward_paid = 0`)
+    .bind(hunterId)
+    .all();
+  const feeRate = feePercent / 100;
+  const totalGross = (results as any[]).reduce((sum, r) => sum + (Number(r.reward_amount) || 0), 0);
+  const totalNet = Math.round(totalGross * (1 - feeRate));
+  return { totalGross, totalNet, count: results.length };
+}
+
+// 未払い合計金額の確認（本人のみ）
+app.get("/hunters/:id/pending-total", async (c) => {
+  const id = c.req.param("id");
+  const user = await getSessionUser(c);
+  if (!user || user.userType !== "hunter" || user.userId !== id) {
+    return c.json({ error: "権限がありません" }, 403);
+  }
+
+  const settings = await getPlatformSettings(c.env.DB, c.env.PLATFORM_PAYPAL_LINK);
+  const { totalGross, totalNet, count } = await getHunterPendingTotal(c.env.DB, id, settings.feePercent);
+
+  const hunter: any = await c.env.DB.prepare(`SELECT payout_requested_at FROM hunters WHERE id = ?`).bind(id).first();
+  const alreadyRequested = !!hunter?.payout_requested_at;
+
+  return c.json({
+    totalGross,
+    totalNet,
+    count,
+    canRequest: totalNet >= PAYOUT_REQUEST_THRESHOLD && !alreadyRequested,
+    threshold: PAYOUT_REQUEST_THRESHOLD,
+    alreadyRequested,
+    requestedAt: hunter?.payout_requested_at || null,
+  });
+});
+
+// 支払いの申請（本人のみ、合計が閾値以上・未申請の場合のみ。運営者へメール通知）
+app.post("/hunters/:id/request-payout", async (c) => {
+  const id = c.req.param("id");
+  const user = await getSessionUser(c);
+  if (!user || user.userType !== "hunter" || user.userId !== id) {
+    return c.json({ error: "権限がありません" }, 403);
+  }
+
+  const hunterRow: any = await c.env.DB.prepare(`SELECT handle, paypal_link, payout_requested_at FROM hunters WHERE id = ?`)
+    .bind(id)
+    .first();
+  if (hunterRow?.payout_requested_at) {
+    return c.json({ error: "すでに支払いを申請済みです" }, 400);
+  }
+
+  const settings = await getPlatformSettings(c.env.DB, c.env.PLATFORM_PAYPAL_LINK);
+  const { totalNet } = await getHunterPendingTotal(c.env.DB, id, settings.feePercent);
+
+  if (totalNet < PAYOUT_REQUEST_THRESHOLD) {
+    return c.json({ error: `未払い合計が¥${PAYOUT_REQUEST_THRESHOLD.toLocaleString()}未満のため申請できません` }, 400);
+  }
+
+  await c.env.DB.prepare(`UPDATE hunters SET payout_requested_at = ? WHERE id = ?`).bind(Date.now(), id).run();
+
+  if (settings.adminEmail) {
+    await sendEmail(
+      c.env.RESEND_API_KEY,
+      settings.adminEmail,
+      `【bughunter.uk】支払い申請: ${hunterRow?.handle || id}`,
+      `ハンター「${hunterRow?.handle || id}」から支払い申請がありました。\n\n未払い合計（手数料差引後）: ¥${totalNet.toLocaleString()}\nPayPal受け取り先: ${hunterRow?.paypal_link || "未登録"}\n\n管理画面の「支払い待ち」から詳細を確認し、送金後は「支払い済みにする」を押してください。`
+    );
+  } else {
+    console.error("adminEmail not set; payout request email not sent");
+  }
+
+  return c.json({ requested: true, totalNet });
+});
+
+
 // 権限チェック：そのレポートの当事者（提出したハンター or 宛先の企業）だけがアクセスできる
 async function getAuthorizedReport(c: any, reportId: string) {
   const report: any = await c.env.DB.prepare(`SELECT * FROM reports WHERE id = ?`).bind(reportId).first();
@@ -1163,12 +1241,12 @@ app.get("/admin/reports/unpaid", async (c) => {
     const { results } = await c.env.DB.prepare(
       `SELECT r.id, r.title, r.reward_amount, r.status, r.created_at,
               p.company_name AS program_company_name,
-              h.id AS hunter_id, h.handle AS hunter_handle, h.paypal_link AS hunter_paypal_link
+              h.id AS hunter_id, h.handle AS hunter_handle, h.paypal_link AS hunter_paypal_link, h.payout_requested_at AS hunter_payout_requested_at
        FROM reports r
        JOIN programs p ON p.id = r.program_id
        LEFT JOIN hunters h ON h.id = r.hunter_id
        WHERE r.reward_amount IS NOT NULL AND r.reward_paid = 0
-       ORDER BY r.created_at ASC`
+       ORDER BY (h.payout_requested_at IS NULL) ASC, r.created_at ASC`
     ).all();
 
     const withFees = (results as any[]).map((r) => {
@@ -1197,6 +1275,15 @@ app.patch("/admin/reports/:id/paid", async (c) => {
 
     const report: any = await c.env.DB.prepare(`SELECT title, hunter_id, reward_amount FROM reports WHERE id = ?`).bind(id).first();
     if (report?.hunter_id) {
+      const remaining = await c.env.DB.prepare(
+        `SELECT COUNT(*) AS c FROM reports WHERE hunter_id = ? AND reward_amount IS NOT NULL AND reward_paid = 0`
+      )
+        .bind(report.hunter_id)
+        .first();
+      if ((remaining as any)?.c === 0) {
+        await c.env.DB.prepare(`UPDATE hunters SET payout_requested_at = NULL WHERE id = ?`).bind(report.hunter_id).run();
+      }
+
       const hunter: any = await c.env.DB.prepare(`SELECT email FROM hunters WHERE id = ?`).bind(report.hunter_id).first();
       if (hunter) {
         await sendEmail(
@@ -1244,6 +1331,12 @@ app.patch("/admin/settings", async (c) => {
         `INSERT INTO platform_settings (key, value) VALUES ('fee_percent', ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value`
       ).bind(String(body.feePercent)).run();
+    }
+    if (body.adminEmail !== undefined) {
+      await c.env.DB.prepare(
+        `INSERT INTO platform_settings (key, value) VALUES ('admin_email', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+      ).bind(body.adminEmail).run();
     }
     return c.json({ updated: true });
   } catch (err) {
