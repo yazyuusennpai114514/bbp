@@ -130,9 +130,9 @@ function generateEmailCode(): string {
   return String(n).padStart(6, "0");
 }
 
-async function sendVerificationEmail(apiKey: string, to: string, code: string): Promise<boolean> {
-  if (!apiKey) {
-    console.error("RESEND_API_KEY is not set; skipping email send");
+async function sendEmail(apiKey: string, to: string, subject: string, text: string): Promise<boolean> {
+  if (!apiKey || !to) {
+    console.error("RESEND_API_KEY or recipient missing; skipping email send");
     return false;
   }
   try {
@@ -145,8 +145,8 @@ async function sendVerificationEmail(apiKey: string, to: string, code: string): 
       body: JSON.stringify({
         from: "bughunter.uk <no-reply@bughunter.uk>",
         to: [to],
-        subject: `【bughunter.uk】確認コード: ${code}`,
-        text: `以下の確認コードをサイトに入力してください。\n\n確認コード: ${code}\n\nこのコードの有効期限は15分です。心当たりがない場合はこのメールを無視してください。`,
+        subject,
+        text,
       }),
     });
     return res.ok;
@@ -154,6 +154,15 @@ async function sendVerificationEmail(apiKey: string, to: string, code: string): 
     console.error("Resend send error:", err);
     return false;
   }
+}
+
+async function sendVerificationEmail(apiKey: string, to: string, code: string): Promise<boolean> {
+  return sendEmail(
+    apiKey,
+    to,
+    `【bughunter.uk】確認コード: ${code}`,
+    `以下の確認コードをサイトに入力してください。\n\n確認コード: ${code}\n\nこのコードの有効期限は15分です。心当たりがない場合はこのメールを無視してください。`
+  );
 }
 
 // =====================================================
@@ -764,6 +773,18 @@ app.post("/reports", async (c) => {
       .bind(id, body.programId, user.userId, body.title, body.severity, body.description, body.poc || null, body.contactEmail, "triage待ち", createdAt)
       .run();
 
+    const program: any = await c.env.DB.prepare(`SELECT company_name, contact_email FROM programs WHERE id = ?`)
+      .bind(body.programId)
+      .first();
+    if (program) {
+      await sendEmail(
+        c.env.RESEND_API_KEY,
+        program.contact_email,
+        `【bughunter.uk】新しいレポートが届きました: ${body.title}`,
+        `${program.company_name} 宛に新しい脆弱性レポートが提出されました。\n\nタイトル: ${body.title}\n重大度: ${body.severity}\n\nサイトにログインして内容を確認してください。`
+      );
+    }
+
     return c.json({ received: true, id, createdAt });
   } catch (err) {
     console.error("D1 insert error:", err);
@@ -884,6 +905,33 @@ app.post("/reports/:id/comments", async (c) => {
       .bind(commentId, id, user.userType, user.userId, String(body.message).trim(), createdAt)
       .run();
 
+    // 返信を書いた側と反対側の相手にメール通知
+    if (user.userType === "hunter") {
+      const program: any = await c.env.DB.prepare(`SELECT company_name, contact_email FROM programs WHERE id = ?`)
+        .bind(report.program_id)
+        .first();
+      if (program) {
+        await sendEmail(
+          c.env.RESEND_API_KEY,
+          program.contact_email,
+          `【bughunter.uk】レポートに返信がありました: ${report.title}`,
+          `ハンターから返信がありました。\n\nレポート: ${report.title}\n\nサイトにログインして内容を確認してください。`
+        );
+      }
+    } else if (report.hunter_id) {
+      const hunter: any = await c.env.DB.prepare(`SELECT handle, email FROM hunters WHERE id = ?`)
+        .bind(report.hunter_id)
+        .first();
+      if (hunter) {
+        await sendEmail(
+          c.env.RESEND_API_KEY,
+          hunter.email,
+          `【bughunter.uk】レポートに返信がありました: ${report.title}`,
+          `企業から返信がありました。\n\nレポート: ${report.title}\n\nサイトにログインして内容を確認してください。`
+        );
+      }
+    }
+
     return c.json({ received: true, id: commentId, createdAt });
   } catch (err) {
     console.error("D1 insert error:", err);
@@ -933,6 +981,19 @@ app.patch("/reports/:id", async (c) => {
     await c.env.DB.prepare(`UPDATE reports SET ${fields.join(", ")} WHERE id = ?`)
       .bind(...values, id)
       .run();
+
+    if (body.status !== undefined && body.status !== report.status && report.hunter_id) {
+      const hunter: any = await c.env.DB.prepare(`SELECT email FROM hunters WHERE id = ?`).bind(report.hunter_id).first();
+      if (hunter) {
+        await sendEmail(
+          c.env.RESEND_API_KEY,
+          hunter.email,
+          `【bughunter.uk】レポートのステータスが更新されました: ${report.title}`,
+          `レポート「${report.title}」のステータスが「${body.status}」に更新されました。\n\nサイトにログインして詳細を確認してください。`
+        );
+      }
+    }
+
     return c.json({ updated: true });
   } catch (err) {
     console.error("D1 update error:", err);
@@ -1103,6 +1164,20 @@ app.patch("/admin/reports/:id/paid", async (c) => {
     await c.env.DB.prepare(`UPDATE reports SET reward_paid = 1, payment_note = COALESCE(?, payment_note) WHERE id = ?`)
       .bind(body?.paymentNote ?? null, id)
       .run();
+
+    const report: any = await c.env.DB.prepare(`SELECT title, hunter_id, reward_amount FROM reports WHERE id = ?`).bind(id).first();
+    if (report?.hunter_id) {
+      const hunter: any = await c.env.DB.prepare(`SELECT email FROM hunters WHERE id = ?`).bind(report.hunter_id).first();
+      if (hunter) {
+        await sendEmail(
+          c.env.RESEND_API_KEY,
+          hunter.email,
+          `【bughunter.uk】報奨金の支払いが完了しました: ${report.title}`,
+          `レポート「${report.title}」の報奨金（¥${Number(report.reward_amount || 0).toLocaleString()}）の送金が完了しました。\n\nPayPalをご確認ください。`
+        );
+      }
+    }
+
     return c.json({ updated: true });
   } catch (err) {
     console.error("D1 update error:", err);
