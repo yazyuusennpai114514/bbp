@@ -274,14 +274,10 @@ app.get("/auth/me", async (c) => {
   const cols =
     user.userType === "hunter"
       ? "id, handle, email, skills, portfolio, paypal_link, avatar_key, created_at"
-      : "id, company_name, contact_email, scope, description, reward_min, reward_max, program_type, last_paid_at, avatar_key, created_at";
+      : "id, company_name, contact_email, scope, description, reward_min, reward_max, program_type, avatar_key, created_at";
 
   const row: any = await c.env.DB.prepare(`SELECT ${cols} FROM ${table} WHERE id = ?`).bind(user.userId).first();
   if (!row) return c.json({ error: "not found" }, 404);
-
-  if (user.userType === "program") {
-    row.is_suspended = isVdpSuspended(row.program_type, row.last_paid_at);
-  }
   return c.json({ userType: user.userType, ...row });
 });
 
@@ -322,8 +318,8 @@ app.post("/programs", async (c) => {
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO programs (id, company_name, contact_email, scope, description, reward_min, reward_max, program_type, last_paid_at, totp_secret, totp_confirmed, backup_codes, email_verified, email_code, email_code_expires, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?)`
+      `INSERT INTO programs (id, company_name, contact_email, scope, description, reward_min, reward_max, program_type, totp_secret, totp_confirmed, backup_codes, email_verified, email_code, email_code_expires, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?)`
     )
       .bind(
         id,
@@ -334,7 +330,6 @@ app.post("/programs", async (c) => {
         Number(body.rewardMin) || 0,
         Number(body.rewardMax) || 0,
         programType,
-        programType === "vdp" ? createdAt : null,
         secret,
         JSON.stringify(hashedBackupCodes),
         emailCodeHash,
@@ -417,22 +412,13 @@ app.post("/programs/:id/confirm-totp", async (c) => {
   return c.json({ confirmed: true, token });
 });
 
-const VDP_SUSPEND_AFTER_MS = 60 * 24 * 60 * 60 * 1000; // 2ヶ月
-
-function isVdpSuspended(programType: string, lastPaidAt: number | null): boolean {
-  if (programType !== "vdp") return false;
-  if (!lastPaidAt) return true;
-  return Date.now() - lastPaidAt > VDP_SUSPEND_AFTER_MS;
-}
-
 app.get("/programs", async (c) => {
   try {
     const { results } = await c.env.DB.prepare(
-      `SELECT id, company_name, contact_email, scope, description, reward_min, reward_max, program_type, last_paid_at, avatar_key, created_at
+      `SELECT id, company_name, contact_email, scope, description, reward_min, reward_max, program_type, avatar_key, created_at
        FROM programs WHERE totp_confirmed = 1 AND email_verified = 1 ORDER BY created_at DESC`
     ).all();
-    const visible = (results as any[]).filter((p) => !isVdpSuspended(p.program_type, p.last_paid_at));
-    return c.json({ programs: visible });
+    return c.json({ programs: results });
   } catch (err) {
     console.error("D1 select error:", err);
     return c.json({ error: "取得に失敗しました" }, 500);
@@ -778,13 +764,10 @@ app.post("/reports", async (c) => {
     return c.json({ error: "severityの値が不正です" }, 400);
   }
 
-  const targetProgram: any = await c.env.DB.prepare(`SELECT company_name, contact_email, program_type, last_paid_at FROM programs WHERE id = ?`)
+  const targetProgram: any = await c.env.DB.prepare(`SELECT company_name, contact_email FROM programs WHERE id = ?`)
     .bind(body.programId)
     .first();
   if (!targetProgram) return c.json({ error: "プログラムが見つかりません" }, 404);
-  if (isVdpSuspended(targetProgram.program_type, targetProgram.last_paid_at)) {
-    return c.json({ error: "このプログラムは現在、支払いの都合で一時停止中です" }, 403);
-  }
 
   const id = crypto.randomUUID();
   const createdAt = Date.now();
@@ -1069,25 +1052,9 @@ app.get("/admin/hunters", async (c) => {
 app.get("/admin/programs", async (c) => {
   if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
   const { results } = await c.env.DB.prepare(
-    `SELECT id, company_name, contact_email, program_type, last_paid_at, avatar_key, totp_confirmed, created_at FROM programs ORDER BY created_at DESC`
+    `SELECT id, company_name, contact_email, program_type, avatar_key, totp_confirmed, created_at FROM programs ORDER BY created_at DESC`
   ).all();
-  const withStatus = (results as any[]).map((p) => ({ ...p, is_suspended: isVdpSuspended(p.program_type, p.last_paid_at) }));
-  return c.json({ programs: withStatus });
-});
-
-// VDPの支払いを記録する（月額更新: amount=500、一時停止からの復活: amount=3000。金額自体は運営者が手動で確認する記録用）
-app.post("/admin/programs/:id/record-payment", async (c) => {
-  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
-  const id = c.req.param("id");
-  try {
-    await c.env.DB.prepare(`UPDATE programs SET last_paid_at = ? WHERE id = ? AND program_type = 'vdp'`)
-      .bind(Date.now(), id)
-      .run();
-    return c.json({ updated: true });
-  } catch (err) {
-    console.error("D1 update error:", err);
-    return c.json({ error: "更新に失敗しました" }, 500);
-  }
+  return c.json({ programs: results });
 });
 
 app.delete("/admin/hunters/:id", async (c) => {
