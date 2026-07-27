@@ -273,7 +273,7 @@ app.get("/auth/me", async (c) => {
   const table = user.userType === "hunter" ? "hunters" : "programs";
   const cols =
     user.userType === "hunter"
-      ? "id, handle, email, skills, portfolio, paypal_link, avatar_key, created_at"
+      ? "id, handle, email, skills, portfolio, paypal_link, points, avatar_key, created_at"
       : "id, company_name, contact_email, scope, description, reward_min, reward_max, program_type, avatar_key, created_at";
 
   const row: any = await c.env.DB.prepare(`SELECT ${cols} FROM ${table} WHERE id = ?`).bind(user.userId).first();
@@ -650,7 +650,7 @@ app.post("/hunters/:id/confirm-totp", async (c) => {
 app.get("/hunters", async (c) => {
   try {
     const { results } = await c.env.DB.prepare(
-      `SELECT id, handle, email, skills, portfolio, avatar_key, created_at
+      `SELECT id, handle, email, skills, portfolio, points, avatar_key, created_at
        FROM hunters WHERE totp_confirmed = 1 AND email_verified = 1 ORDER BY created_at DESC`
     ).all();
     return c.json({ hunters: results });
@@ -943,7 +943,14 @@ app.post("/reports/:id/comments", async (c) => {
   }
 });
 
-const VALID_STATUSES = ["トリアージ", "返信待ち", "info", "解決済み", "スパム", "N/A", "閉鎖"];
+const VALID_STATUSES = ["トリアージ", "返信待ち", "info", "解決済み", "スパム", "N/A", "重複", "閉鎖"];
+
+// ステータスごとのポイント（該当しないステータスは0）
+function statusPoints(status: string, programType: string): number {
+  if (status === "解決済み") return programType === "vdp" ? 20 : 10;
+  if (status === "N/A") return -10;
+  return 0;
+}
 
 // ステータス変更・報奨金の付与・支払い状況の更新（宛先企業のみ）
 app.patch("/reports/:id", async (c) => {
@@ -963,10 +970,12 @@ app.patch("/reports/:id", async (c) => {
   if (body.rewardAmount !== undefined && body.rewardAmount !== null && Number(body.rewardAmount) < 0) {
     return c.json({ error: "報奨金額は0以上にしてください" }, 400);
   }
+
+  const programRow: any = await c.env.DB.prepare(`SELECT program_type FROM programs WHERE id = ?`)
+    .bind(report.program_id)
+    .first();
+
   if (body.rewardAmount !== undefined && body.rewardAmount !== null) {
-    const programRow: any = await c.env.DB.prepare(`SELECT program_type FROM programs WHERE id = ?`)
-      .bind(report.program_id)
-      .first();
     if (programRow?.program_type === "vdp") {
       return c.json({ error: "VDPプログラムでは報奨金を設定できません" }, 400);
     }
@@ -995,6 +1004,15 @@ app.patch("/reports/:id", async (c) => {
       .run();
 
     if (body.status !== undefined && body.status !== report.status && report.hunter_id) {
+      const programType = programRow?.program_type || "bbp";
+      const delta = statusPoints(body.status, programType) - statusPoints(report.status, programType);
+
+      if (delta !== 0) {
+        await c.env.DB.prepare(`UPDATE hunters SET points = points + ? WHERE id = ?`)
+          .bind(delta, report.hunter_id)
+          .run();
+      }
+
       const hunter: any = await c.env.DB.prepare(`SELECT email FROM hunters WHERE id = ?`).bind(report.hunter_id).first();
       if (hunter) {
         await sendEmail(
@@ -1044,7 +1062,7 @@ function requireAdmin(c: any): boolean {
 app.get("/admin/hunters", async (c) => {
   if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
   const { results } = await c.env.DB.prepare(
-    `SELECT id, handle, email, paypal_link, avatar_key, totp_confirmed, created_at FROM hunters ORDER BY created_at DESC`
+    `SELECT id, handle, email, paypal_link, points, avatar_key, totp_confirmed, created_at FROM hunters ORDER BY created_at DESC`
   ).all();
   return c.json({ hunters: results });
 });
