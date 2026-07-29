@@ -1345,4 +1345,227 @@ app.patch("/admin/settings", async (c) => {
   }
 });
 
+// =====================================================
+// 事前登録（公開前のランディングページ用）
+// =====================================================
+
+app.post("/pre-register", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const email = (body?.email || "").trim();
+  const role = body?.role === "program" ? "program" : "hunter";
+
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return c.json({ error: "有効なメールアドレスを入力してください" }, 400);
+  }
+
+  try {
+    await c.env.DB.prepare(`INSERT INTO pre_registrations (id, email, role, created_at) VALUES (?, ?, ?, ?)`)
+      .bind(crypto.randomUUID(), email, role, Date.now())
+      .run();
+    return c.json({ received: true });
+  } catch (err: any) {
+    if (String(err?.message || "").includes("UNIQUE")) {
+      return c.json({ received: true, alreadyRegistered: true });
+    }
+    console.error("D1 insert error:", err);
+    return c.json({ error: "登録に失敗しました" }, 500);
+  }
+});
+
+app.get("/admin/pre-registrations", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, email, role, created_at FROM pre_registrations ORDER BY created_at DESC`
+  ).all();
+  return c.json({ registrations: results });
+});
+
+// お問い合わせフォーム（認証不要、運営者にメール通知）
+app.post("/contact", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (!body || !body.name || !body.email || !body.message) {
+    return c.json({ error: "必須項目が不足しています" }, 400);
+  }
+  if (String(body.message).length > 5000) {
+    return c.json({ error: "本文が長すぎます" }, 400);
+  }
+
+  const settings = await getPlatformSettings(c.env.DB, c.env.PLATFORM_PAYPAL_LINK);
+  if (!settings.adminEmail) {
+    return c.json({ error: "現在お問い合わせを受け付けられません。時間をおいて再度お試しください" }, 500);
+  }
+
+  const sent = await sendEmail(
+    c.env.RESEND_API_KEY,
+    settings.adminEmail,
+    `【bughunter.uk】お問い合わせ: ${body.name}`,
+    `名前: ${body.name}\nメールアドレス: ${body.email}\n\n${body.message}`
+  );
+
+  return c.json({ sent });
+});
+
+// =====================================================
+// サポートチケット
+// =====================================================
+
+const TICKET_STATUSES = ["未対応", "対応中", "解決済み"];
+
+// チケット作成（誰でも可、本人確認は無し。以後の閲覧はID+メールで行う）
+app.post("/support/tickets", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (!body || !body.name || !body.email || !body.subject || !body.message) {
+    return c.json({ error: "必須項目が不足しています" }, 400);
+  }
+  if (String(body.message).length > 5000) {
+    return c.json({ error: "本文が長すぎます" }, 400);
+  }
+
+  const id = crypto.randomUUID();
+  const createdAt = Date.now();
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO support_tickets (id, name, email, subject, message, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(id, body.name, body.email, body.subject, body.message, "未対応", createdAt)
+      .run();
+
+    const settings = await getPlatformSettings(c.env.DB, c.env.PLATFORM_PAYPAL_LINK);
+    if (settings.adminEmail) {
+      await sendEmail(
+        c.env.RESEND_API_KEY,
+        settings.adminEmail,
+        `【bughunter.uk】新しいサポートチケット: ${body.subject}`,
+        `${body.name} (${body.email}) からチケットが届きました。\n\n件名: ${body.subject}\n\n${body.message}\n\n管理画面から返信してください。チケットID: ${id}`
+      );
+    }
+    await sendEmail(
+      c.env.RESEND_API_KEY,
+      body.email,
+      `【bughunter.uk】お問い合わせを受け付けました: ${body.subject}`,
+      `お問い合わせありがとうございます。以下の内容で受け付けました。\n\n件名: ${body.subject}\n\n${body.message}\n\nチケットID: ${id}\n\nこのIDと登録したメールアドレスで、後から対応状況を確認できます。`
+    );
+
+    return c.json({ received: true, id });
+  } catch (err) {
+    console.error("D1 insert error:", err);
+    return c.json({ error: "送信に失敗しました" }, 500);
+  }
+});
+
+// チケット詳細確認（本人: ID + メールアドレスの一致が必要）
+app.get("/support/tickets/:id", async (c) => {
+  const id = c.req.param("id");
+  const email = c.req.query("email");
+  if (!email) return c.json({ error: "メールアドレスを指定してください" }, 400);
+
+  const ticket: any = await c.env.DB.prepare(`SELECT * FROM support_tickets WHERE id = ?`).bind(id).first();
+  if (!ticket || ticket.email.toLowerCase() !== email.toLowerCase()) {
+    return c.json({ error: "チケットが見つかりません" }, 404);
+  }
+
+  const { results } = await c.env.DB.prepare(`SELECT * FROM support_replies WHERE ticket_id = ? ORDER BY created_at ASC`)
+    .bind(id)
+    .all();
+
+  return c.json({ ticket, replies: results });
+});
+
+// 本人からの追記返信
+app.post("/support/tickets/:id/replies", async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => null);
+  if (!body || !body.email || !body.message) {
+    return c.json({ error: "必須項目が不足しています" }, 400);
+  }
+
+  const ticket: any = await c.env.DB.prepare(`SELECT * FROM support_tickets WHERE id = ?`).bind(id).first();
+  if (!ticket || ticket.email.toLowerCase() !== String(body.email).toLowerCase()) {
+    return c.json({ error: "チケットが見つかりません" }, 404);
+  }
+
+  const replyId = crypto.randomUUID();
+  const createdAt = Date.now();
+  await c.env.DB.prepare(
+    `INSERT INTO support_replies (id, ticket_id, author_type, message, created_at) VALUES (?, ?, 'user', ?, ?)`
+  )
+    .bind(replyId, id, String(body.message).trim(), createdAt)
+    .run();
+
+  const settings = await getPlatformSettings(c.env.DB, c.env.PLATFORM_PAYPAL_LINK);
+  if (settings.adminEmail) {
+    await sendEmail(
+      c.env.RESEND_API_KEY,
+      settings.adminEmail,
+      `【bughunter.uk】チケットに追記がありました: ${ticket.subject}`,
+      `${ticket.name} からチケットに追記がありました。\n\nチケットID: ${id}\n\n${body.message}`
+    );
+  }
+
+  return c.json({ received: true, id: replyId, createdAt });
+});
+
+// ---------- 管理者用 ----------
+
+app.get("/admin/support/tickets", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const { results } = await c.env.DB.prepare(`SELECT * FROM support_tickets ORDER BY created_at DESC`).all();
+  return c.json({ tickets: results });
+});
+
+app.get("/admin/support/tickets/:id", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const id = c.req.param("id");
+  const ticket = await c.env.DB.prepare(`SELECT * FROM support_tickets WHERE id = ?`).bind(id).first();
+  if (!ticket) return c.json({ error: "not found" }, 404);
+  const { results } = await c.env.DB.prepare(`SELECT * FROM support_replies WHERE ticket_id = ? ORDER BY created_at ASC`)
+    .bind(id)
+    .all();
+  return c.json({ ticket, replies: results });
+});
+
+app.patch("/admin/support/tickets/:id", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => null);
+  if (!body || !body.status || !TICKET_STATUSES.includes(body.status)) {
+    return c.json({ error: "ステータスの値が不正です" }, 400);
+  }
+  await c.env.DB.prepare(`UPDATE support_tickets SET status = ? WHERE id = ?`).bind(body.status, id).run();
+  return c.json({ updated: true });
+});
+
+app.post("/admin/support/tickets/:id/replies", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => null);
+  if (!body || !body.message) return c.json({ error: "メッセージを入力してください" }, 400);
+
+  const ticket: any = await c.env.DB.prepare(`SELECT * FROM support_tickets WHERE id = ?`).bind(id).first();
+  if (!ticket) return c.json({ error: "not found" }, 404);
+
+  const replyId = crypto.randomUUID();
+  const createdAt = Date.now();
+  await c.env.DB.prepare(
+    `INSERT INTO support_replies (id, ticket_id, author_type, message, created_at) VALUES (?, ?, 'admin', ?, ?)`
+  )
+    .bind(replyId, id, String(body.message).trim(), createdAt)
+    .run();
+
+  // 返信したら自動的に「対応中」にする（すでに解決済みならそのまま）
+  if (ticket.status === "未対応") {
+    await c.env.DB.prepare(`UPDATE support_tickets SET status = '対応中' WHERE id = ?`).bind(id).run();
+  }
+
+  await sendEmail(
+    c.env.RESEND_API_KEY,
+    ticket.email,
+    `【bughunter.uk】お問い合わせに返信がありました: ${ticket.subject}`,
+    `お問い合わせ「${ticket.subject}」に返信がありました。\n\n${body.message}\n\nチケットID: ${id}\nサイトのチケット確認ページから続きをご覧いただけます。`
+  );
+
+  return c.json({ received: true, id: replyId, createdAt });
+});
+
 export default app;
