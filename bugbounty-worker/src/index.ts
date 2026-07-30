@@ -1411,24 +1411,41 @@ app.post("/contact", async (c) => {
 
 const TICKET_STATUSES = ["未対応", "対応中", "解決済み"];
 
-// チケット作成（誰でも可、本人確認は無し。以後の閲覧はID+メールで行う）
+// アカウントの表示名・メールアドレスを取得するヘルパー
+async function getAccountIdentity(db: D1Database, user: SessionUser): Promise<{ name: string; email: string } | null> {
+  if (user.userType === "hunter") {
+    const row: any = await db.prepare(`SELECT handle, email FROM hunters WHERE id = ?`).bind(user.userId).first();
+    return row ? { name: row.handle, email: row.email } : null;
+  }
+  const row: any = await db.prepare(`SELECT company_name, contact_email FROM programs WHERE id = ?`).bind(user.userId).first();
+  return row ? { name: row.company_name, email: row.contact_email } : null;
+}
+
+// チケット作成（ログイン必須。名前・メールはアカウント情報から自動で使う）
 app.post("/support/tickets", async (c) => {
+  const user = await getSessionUser(c);
+  if (!user) return c.json({ error: "ログインが必要です" }, 401);
+
   const body = await c.req.json().catch(() => null);
-  if (!body || !body.name || !body.email || !body.subject || !body.message) {
+  if (!body || !body.subject || !body.message) {
     return c.json({ error: "必須項目が不足しています" }, 400);
   }
   if (String(body.message).length > 5000) {
     return c.json({ error: "本文が長すぎます" }, 400);
   }
 
+  const identity = await getAccountIdentity(c.env.DB, user);
+  if (!identity) return c.json({ error: "アカウント情報が見つかりません" }, 404);
+
   const id = crypto.randomUUID();
   const createdAt = Date.now();
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO support_tickets (id, name, email, subject, message, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO support_tickets (id, name, email, user_type, user_id, subject, message, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-      .bind(id, body.name, body.email, body.subject, body.message, "未対応", createdAt)
+      .bind(id, identity.name, identity.email, user.userType, user.userId, body.subject, body.message, "未対応", createdAt)
       .run();
 
     const settings = await getPlatformSettings(c.env.DB, c.env.PLATFORM_PAYPAL_LINK);
@@ -1437,14 +1454,14 @@ app.post("/support/tickets", async (c) => {
         c.env.RESEND_API_KEY,
         settings.adminEmail,
         `【bughunter.uk】新しいサポートチケット: ${body.subject}`,
-        `${body.name} (${body.email}) からチケットが届きました。\n\n件名: ${body.subject}\n\n${body.message}\n\n管理画面から返信してください。チケットID: ${id}`
+        `${identity.name}（${identity.email} / ${user.userType === "hunter" ? "ハンター" : "企業"}）からチケットが届きました。\n\n件名: ${body.subject}\n\n${body.message}\n\n管理画面から返信してください。チケットID: ${id}`
       );
     }
     await sendEmail(
       c.env.RESEND_API_KEY,
-      body.email,
+      identity.email,
       `【bughunter.uk】お問い合わせを受け付けました: ${body.subject}`,
-      `お問い合わせありがとうございます。以下の内容で受け付けました。\n\n件名: ${body.subject}\n\n${body.message}\n\nチケットID: ${id}\n\nこのIDと登録したメールアドレスで、後から対応状況を確認できます。`
+      `お問い合わせありがとうございます。以下の内容で受け付けました。\n\n件名: ${body.subject}\n\n${body.message}\n\nサイトにログインし、マイチケットから対応状況を確認できます。`
     );
 
     return c.json({ received: true, id });
@@ -1454,16 +1471,34 @@ app.post("/support/tickets", async (c) => {
   }
 });
 
-// チケット詳細確認（本人: ID + メールアドレスの一致が必要）
+// 自分のチケット一覧（ログイン必須、本人分のみ）
+app.get("/support/my-tickets", async (c) => {
+  const user = await getSessionUser(c);
+  if (!user) return c.json({ error: "ログインが必要です" }, 401);
+
+  const { results } = await c.env.DB.prepare(
+    `SELECT * FROM support_tickets WHERE user_type = ? AND user_id = ? ORDER BY created_at DESC`
+  )
+    .bind(user.userType, user.userId)
+    .all();
+
+  return c.json({ tickets: results });
+});
+
+async function getAuthorizedTicket(c: any, ticketId: string) {
+  const ticket: any = await c.env.DB.prepare(`SELECT * FROM support_tickets WHERE id = ?`).bind(ticketId).first();
+  if (!ticket) return { ticket: null, user: null };
+  const user = await getSessionUser(c);
+  const ok = !!user && ticket.user_type === user.userType && ticket.user_id === user.userId;
+  return { ticket, user: ok ? user : null };
+}
+
+// チケット詳細確認（本人のみ）
 app.get("/support/tickets/:id", async (c) => {
   const id = c.req.param("id");
-  const email = c.req.query("email");
-  if (!email) return c.json({ error: "メールアドレスを指定してください" }, 400);
-
-  const ticket: any = await c.env.DB.prepare(`SELECT * FROM support_tickets WHERE id = ?`).bind(id).first();
-  if (!ticket || ticket.email.toLowerCase() !== email.toLowerCase()) {
-    return c.json({ error: "チケットが見つかりません" }, 404);
-  }
+  const { ticket, user } = await getAuthorizedTicket(c, id);
+  if (!ticket) return c.json({ error: "not found" }, 404);
+  if (!user) return c.json({ error: "権限がありません" }, 403);
 
   const { results } = await c.env.DB.prepare(`SELECT * FROM support_replies WHERE ticket_id = ? ORDER BY created_at ASC`)
     .bind(id)
@@ -1475,14 +1510,13 @@ app.get("/support/tickets/:id", async (c) => {
 // 本人からの追記返信
 app.post("/support/tickets/:id/replies", async (c) => {
   const id = c.req.param("id");
-  const body = await c.req.json().catch(() => null);
-  if (!body || !body.email || !body.message) {
-    return c.json({ error: "必須項目が不足しています" }, 400);
-  }
+  const { ticket, user } = await getAuthorizedTicket(c, id);
+  if (!ticket) return c.json({ error: "not found" }, 404);
+  if (!user) return c.json({ error: "権限がありません" }, 403);
 
-  const ticket: any = await c.env.DB.prepare(`SELECT * FROM support_tickets WHERE id = ?`).bind(id).first();
-  if (!ticket || ticket.email.toLowerCase() !== String(body.email).toLowerCase()) {
-    return c.json({ error: "チケットが見つかりません" }, 404);
+  const body = await c.req.json().catch(() => null);
+  if (!body || !body.message) {
+    return c.json({ error: "メッセージを入力してください" }, 400);
   }
 
   const replyId = crypto.randomUUID();
