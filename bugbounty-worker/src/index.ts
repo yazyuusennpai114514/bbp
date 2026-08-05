@@ -9,7 +9,7 @@ type Bindings = {
   RESEND_API_KEY: string;
 };
 
-type SessionUser = { userType: "hunter" | "program"; userId: string };
+type SessionUser = { userType: "hunter" | "program"; userId: string; actorType: "owner" | "member"; actorId: string | null };
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -171,13 +171,21 @@ async function sendVerificationEmail(apiKey: string, to: string, code: string): 
 
 const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 
-async function createSession(db: D1Database, userType: "hunter" | "program", userId: string): Promise<string> {
+async function createSession(
+  db: D1Database,
+  userType: "hunter" | "program",
+  userId: string,
+  actorType: "owner" | "member" = "owner",
+  actorId: string | null = null
+): Promise<string> {
   const token = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, "");
   const createdAt = Date.now();
   const expiresAt = createdAt + SESSION_DURATION_MS;
   await db
-    .prepare(`INSERT INTO sessions (token, user_type, user_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)`)
-    .bind(token, userType, userId, createdAt, expiresAt)
+    .prepare(
+      `INSERT INTO sessions (token, user_type, user_id, actor_type, actor_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(token, userType, userId, actorType, actorId, createdAt, expiresAt)
     .run();
   return token;
 }
@@ -186,10 +194,15 @@ async function getSessionUser(c: any): Promise<SessionUser | null> {
   const auth = c.req.header("Authorization");
   if (!auth || !auth.startsWith("Bearer ")) return null;
   const token = auth.slice(7);
-  const row = await c.env.DB.prepare(`SELECT * FROM sessions WHERE token = ?`).bind(token).first();
+  const row: any = await c.env.DB.prepare(`SELECT * FROM sessions WHERE token = ?`).bind(token).first();
   if (!row) return null;
-  if ((row as any).expires_at < Date.now()) return null;
-  return { userType: (row as any).user_type, userId: (row as any).user_id };
+  if (row.expires_at < Date.now()) return null;
+  return {
+    userType: row.user_type,
+    userId: row.user_id,
+    actorType: row.actor_type || "owner",
+    actorId: row.actor_id || null,
+  };
 }
 
 const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
@@ -234,38 +247,78 @@ app.post("/auth/login", async (c) => {
     return c.json({ error: "userTypeが不正です" }, 400);
   }
 
-  const table = body.userType === "hunter" ? "hunters" : "programs";
-  const emailCol = body.userType === "hunter" ? "email" : "contact_email";
+  // 企業ログインの場合、まずオーナー（programs）を探し、無ければチームメンバーを探す
+  if (body.userType === "program") {
+    const owner: any = await c.env.DB.prepare(`SELECT * FROM programs WHERE contact_email = ?`).bind(body.email).first();
+    if (owner) {
+      if (!owner.totp_confirmed || !owner.email_verified) {
+        return c.json({ error: "メールアドレスが未登録か、認証アプリ・メール確認の設定が完了していません" }, 401);
+      }
+      return await tryLoginAndRespond(c, owner, body.code, "program", owner.id, "owner", null, owner.company_name);
+    }
 
-  const row: any = await c.env.DB.prepare(`SELECT * FROM ${table} WHERE ${emailCol} = ?`).bind(body.email).first();
-  if (!row || !row.totp_confirmed || !row.email_verified) {
+    const member: any = await c.env.DB.prepare(`SELECT * FROM program_members WHERE email = ? AND active = 1`).bind(body.email).first();
+    if (member) {
+      const program: any = await c.env.DB.prepare(`SELECT company_name FROM programs WHERE id = ?`).bind(member.program_id).first();
+      return await tryLoginAndRespond(
+        c,
+        member,
+        body.code,
+        "program",
+        member.program_id,
+        "member",
+        member.id,
+        `${member.name}（${program?.company_name || "企業"}）`
+      );
+    }
+
     return c.json({ error: "メールアドレスが未登録か、認証アプリ・メール確認の設定が完了していません" }, 401);
   }
 
-  const isTotpValid = await verifyTotp(row.totp_secret, body.code);
+  // ハンターログイン
+  const row: any = await c.env.DB.prepare(`SELECT * FROM hunters WHERE email = ?`).bind(body.email).first();
+  if (!row || !row.totp_confirmed || !row.email_verified) {
+    return c.json({ error: "メールアドレスが未登録か、認証アプリ・メール確認の設定が完了していません" }, 401);
+  }
+  return await tryLoginAndRespond(c, row, body.code, "hunter", row.id, "owner", null, row.handle);
+});
+
+// TOTP／バックアップコードを検証し、成功したらセッションを発行して返す共通処理
+async function tryLoginAndRespond(
+  c: any,
+  row: any,
+  code: string,
+  userType: "hunter" | "program",
+  userId: string,
+  actorType: "owner" | "member",
+  actorId: string | null,
+  name: string
+) {
+  const isTotpValid = await verifyTotp(row.totp_secret, code);
   if (isTotpValid) {
-    const token = await createSession(c.env.DB, body.userType, row.id);
-    return c.json({ token, userType: body.userType, id: row.id, name: body.userType === "hunter" ? row.handle : row.company_name });
+    const token = await createSession(c.env.DB, userType, userId, actorType, actorId);
+    return c.json({ token, userType, id: userId, name, isOwner: actorType === "owner" });
   }
 
-  // 6桁コードで失敗したら、バックアップコードとしても試す
   const hashedCodes: string[] = row.backup_codes ? JSON.parse(row.backup_codes) : [];
-  const remaining = await consumeBackupCode(hashedCodes, body.code);
+  const remaining = await consumeBackupCode(hashedCodes, code);
   if (remaining) {
+    const table = actorType === "member" ? "program_members" : userType === "hunter" ? "hunters" : "programs";
     await c.env.DB.prepare(`UPDATE ${table} SET backup_codes = ? WHERE id = ?`).bind(JSON.stringify(remaining), row.id).run();
-    const token = await createSession(c.env.DB, body.userType, row.id);
+    const token = await createSession(c.env.DB, userType, userId, actorType, actorId);
     return c.json({
       token,
-      userType: body.userType,
-      id: row.id,
-      name: body.userType === "hunter" ? row.handle : row.company_name,
+      userType,
+      id: userId,
+      name,
+      isOwner: actorType === "owner",
       usedBackupCode: true,
       backupCodesRemaining: remaining.length,
     });
   }
 
   return c.json({ error: "コードが正しくありません" }, 401);
-});
+}
 
 app.get("/auth/me", async (c) => {
   const user = await getSessionUser(c);
@@ -279,7 +332,19 @@ app.get("/auth/me", async (c) => {
 
   const row: any = await c.env.DB.prepare(`SELECT ${cols} FROM ${table} WHERE id = ?`).bind(user.userId).first();
   if (!row) return c.json({ error: "not found" }, 404);
-  return c.json({ userType: user.userType, ...row });
+
+  let actingMemberName = null;
+  if (user.userType === "program" && user.actorType === "member" && user.actorId) {
+    const member: any = await c.env.DB.prepare(`SELECT name FROM program_members WHERE id = ?`).bind(user.actorId).first();
+    actingMemberName = member?.name || null;
+  }
+
+  return c.json({
+    userType: user.userType,
+    isOwner: user.actorType === "owner",
+    actingMemberName,
+    ...row,
+  });
 });
 
 app.post("/auth/logout", async (c) => {
@@ -437,43 +502,6 @@ app.patch("/programs/:id", async (c) => {
   const body = await c.req.json().catch(() => null);
   if (!body) return c.json({ error: "リクエストが不正です" }, 400);
 
-  const companyName = body.companyName;
-  const scope = body.scope;
-  const description = body.description;
-  const rewardMin = Number(body.rewardMin) || 0;
-  const rewardMax = Number(body.rewardMax) || 0;
-
-  if (!companyName || !scope || !description) {
-    return c.json({ error: "必須項目が不足しています" }, 400);
-  }
-  if (rewardMin > rewardMax) {
-    return c.json({ error: "報奨金の下限は上限以下にしてください" }, 400);
-  }
-
-  try {
-    await c.env.DB.prepare(
-      `UPDATE programs SET company_name = ?, scope = ?, description = ?, reward_min = ?, reward_max = ? WHERE id = ?`
-    )
-      .bind(companyName, scope, description, rewardMin, rewardMax, id)
-      .run();
-    return c.json({ updated: true });
-  } catch (err) {
-    console.error("D1 update error:", err);
-    return c.json({ error: "更新に失敗しました" }, 500);
-  }
-});
-
-// プロフィール編集（本人のみ）
-app.patch("/programs/:id", async (c) => {
-  const id = c.req.param("id");
-  const user = await getSessionUser(c);
-  if (!user || user.userType !== "program" || user.userId !== id) {
-    return c.json({ error: "権限がありません。ログインし直してください" }, 403);
-  }
-
-  const body = await c.req.json().catch(() => null);
-  if (!body) return c.json({ error: "リクエストが不正です" }, 400);
-
   const companyName = body.companyName ?? null;
   const scope = body.scope ?? null;
   const description = body.description ?? null;
@@ -504,6 +532,97 @@ app.patch("/programs/:id", async (c) => {
   } catch (err) {
     console.error("D1 update error:", err);
     return c.json({ error: "更新に失敗しました" }, 500);
+  }
+});
+
+// =====================================================
+// チームメンバー（企業アカウントの子アカウント）
+// =====================================================
+
+// メンバー一覧（オーナーのみ）
+app.get("/programs/:id/members", async (c) => {
+  const id = c.req.param("id");
+  const user = await getSessionUser(c);
+  if (!user || user.userType !== "program" || user.userId !== id || user.actorType !== "owner") {
+    return c.json({ error: "権限がありません" }, 403);
+  }
+
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, name, email, created_at FROM program_members WHERE program_id = ? AND active = 1 ORDER BY created_at DESC`
+  )
+    .bind(id)
+    .all();
+  return c.json({ members: results });
+});
+
+// メンバー追加（オーナーのみ）。TOTPシークレット・バックアップコードはこのレスポンスで一度だけ返す
+app.post("/programs/:id/members", async (c) => {
+  const id = c.req.param("id");
+  const user = await getSessionUser(c);
+  if (!user || user.userType !== "program" || user.userId !== id || user.actorType !== "owner") {
+    return c.json({ error: "権限がありません" }, 403);
+  }
+
+  const body = await c.req.json().catch(() => null);
+  if (!body || !body.name || !body.email) {
+    return c.json({ error: "名前とメールアドレスは必須です" }, 400);
+  }
+
+  const existingProgram = await c.env.DB.prepare(`SELECT id FROM programs WHERE contact_email = ?`).bind(body.email).first();
+  const existingMember = await c.env.DB.prepare(`SELECT id FROM program_members WHERE email = ?`).bind(body.email).first();
+  if (existingProgram || existingMember) {
+    return c.json({ error: "このメールアドレスは既に使われています" }, 409);
+  }
+
+  const memberId = crypto.randomUUID();
+  const createdAt = Date.now();
+  const secret = generateTotpSecret();
+  const backupCodes = generateBackupCodes();
+  const hashedBackupCodes = await Promise.all(backupCodes.map(hashCode));
+
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO program_members (id, program_id, name, email, totp_secret, backup_codes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(memberId, id, body.name, body.email, secret, JSON.stringify(hashedBackupCodes), createdAt)
+      .run();
+
+    await sendEmail(
+      c.env.RESEND_API_KEY,
+      body.email,
+      `【bughunter.uk】チームメンバーとして追加されました`,
+      `bughunter.uk のチームメンバーとして追加されました。\n\nログイン用の認証アプリ設定（QRコード・バックアップコード）は、追加した担当者から直接お受け取りください。\n\nログイン画面で「企業」を選び、このメールアドレスとログイン先から共有される認証コードでログインできます。`
+    );
+
+    const otpauthUrl = `otpauth://totp/BBP:${encodeURIComponent(body.email)}?secret=${secret}&issuer=BBP&algorithm=SHA1&digits=6&period=30`;
+    return c.json({ id: memberId, name: body.name, email: body.email, secret, otpauthUrl, backupCodes });
+  } catch (err: any) {
+    if (String(err?.message || "").includes("UNIQUE")) {
+      return c.json({ error: "このメールアドレスは既に使われています" }, 409);
+    }
+    console.error("D1 insert error:", err);
+    return c.json({ error: "追加に失敗しました" }, 500);
+  }
+});
+
+// メンバーを非表示化（オーナーのみ）。データは残したまま、企業側の一覧・ログインだけを止める
+app.delete("/programs/:id/members/:memberId", async (c) => {
+  const id = c.req.param("id");
+  const memberId = c.req.param("memberId");
+  const user = await getSessionUser(c);
+  if (!user || user.userType !== "program" || user.userId !== id || user.actorType !== "owner") {
+    return c.json({ error: "権限がありません" }, 403);
+  }
+
+  try {
+    await c.env.DB.prepare(`DELETE FROM sessions WHERE user_type = 'program' AND user_id = ? AND actor_type = 'member' AND actor_id = ?`)
+      .bind(id, memberId)
+      .run();
+    await c.env.DB.prepare(`UPDATE program_members SET active = 0 WHERE id = ? AND program_id = ?`).bind(memberId, id).run();
+    return c.json({ deleted: true });
+  } catch (err) {
+    console.error("D1 update error:", err);
+    return c.json({ error: "処理に失敗しました" }, 500);
   }
 });
 
@@ -804,8 +923,13 @@ app.get("/programs/:id/reports", async (c) => {
   if (!user || user.userType !== "program" || user.userId !== programId) {
     return c.json({ error: "権限がありません。ログインし直してください" }, 403);
   }
+  const includeHidden = c.req.query("includeHidden") === "1";
   try {
-    const { results } = await c.env.DB.prepare(`SELECT * FROM reports WHERE program_id = ? ORDER BY created_at DESC`)
+    const { results } = await c.env.DB.prepare(
+      includeHidden
+        ? `SELECT * FROM reports WHERE program_id = ? ORDER BY created_at DESC`
+        : `SELECT * FROM reports WHERE program_id = ? AND hidden_by_company = 0 ORDER BY created_at DESC`
+    )
       .bind(programId)
       .all();
     return c.json({ reports: results });
@@ -1069,6 +1193,10 @@ app.patch("/reports/:id", async (c) => {
   if (body.rewardAmount !== undefined) {
     fields.push("reward_amount = ?");
     values.push(body.rewardAmount === null ? null : Number(body.rewardAmount));
+  }
+  if (body.hiddenByCompany !== undefined) {
+    fields.push("hidden_by_company = ?");
+    values.push(body.hiddenByCompany ? 1 : 0);
   }
   // reward_paid / payment_note は運営者(管理画面)側だけが更新できる。企業側からは変更不可。
 
