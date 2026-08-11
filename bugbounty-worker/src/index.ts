@@ -13,7 +13,60 @@ type SessionUser = { userType: "hunter" | "program"; userId: string; actorType: 
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-app.use("*", cors());
+// 自分のサイトからのアクセスだけ許可する。新しいサイトを追加した時はここにも追記すること
+const ALLOWED_ORIGINS = [
+  "https://bughunter.uk",
+  "https://www.bughunter.uk",
+  "https://zizenntouroku.bughunter.uk", // 事前登録サイト
+  "https://support.bughunter.uk", // サポートサイト
+  "https://admin.bughunter.uk", // 管理画面（独自ドメインを設定していない場合は *.pages.dev のURLに変更）
+];
+
+app.use(
+  "*",
+  cors({
+    origin: (origin) => (origin && ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0]),
+    allowHeaders: ["Content-Type", "Authorization", "X-Admin-Key"],
+  })
+);
+
+// =====================================================
+// レート制限（総当たり攻撃・スパム対策）
+// =====================================================
+
+// key: 制限をかける単位（例: "login:user@example.com"、"totp:programId"）
+// 戻り値 true = 制限内（処理続行OK）、false = 制限超過（拒否すべき）
+async function checkRateLimit(db: D1Database, key: string, maxAttempts: number, windowMs: number): Promise<boolean> {
+  const now = Date.now();
+  try {
+    const row: any = await db.prepare(`SELECT count, window_start FROM rate_limits WHERE key = ?`).bind(key).first();
+
+    if (!row || now - row.window_start > windowMs) {
+      // ウィンドウが無い、または期限切れなら新しく数え直す
+      await db
+        .prepare(
+          `INSERT INTO rate_limits (key, count, window_start) VALUES (?, 1, ?)
+           ON CONFLICT(key) DO UPDATE SET count = 1, window_start = excluded.window_start`
+        )
+        .bind(key, now)
+        .run();
+      return true;
+    }
+
+    if (row.count >= maxAttempts) return false;
+
+    await db.prepare(`UPDATE rate_limits SET count = count + 1 WHERE key = ?`).bind(key).run();
+    return true;
+  } catch (err) {
+    // rate_limitsテーブルが無い等の場合は、機能を止めないためフェイルオープンにする
+    console.error("rate limit check error:", err);
+    return true;
+  }
+}
+
+function clientIp(c: any): string {
+  return c.req.header("cf-connecting-ip") || c.req.header("x-forwarded-for") || "unknown";
+}
 
 // =====================================================
 // TOTP (RFC 6238) - Web Crypto のみで実装、外部ライブラリ不要
@@ -247,6 +300,13 @@ app.post("/auth/login", async (c) => {
     return c.json({ error: "userTypeが不正です" }, 400);
   }
 
+  // TOTPコードの総当たりを防ぐため、メールアドレス単位・IP単位の両方で制限する
+  const emailOk = await checkRateLimit(c.env.DB, `login:email:${body.email.toLowerCase()}`, 10, 15 * 60 * 1000);
+  const ipOk = await checkRateLimit(c.env.DB, `login:ip:${clientIp(c)}`, 30, 15 * 60 * 1000);
+  if (!emailOk || !ipOk) {
+    return c.json({ error: "試行回数が多すぎます。しばらく待ってから再度お試しください" }, 429);
+  }
+
   // 企業ログインの場合、まずオーナー（programs）を探し、無ければチームメンバーを探す
   if (body.userType === "program") {
     const owner: any = await c.env.DB.prepare(`SELECT * FROM programs WHERE contact_email = ?`).bind(body.email).first();
@@ -361,10 +421,16 @@ app.post("/auth/logout", async (c) => {
 
 // 登録: パスワードは受け取らない。TOTPシークレットとバックアップコードを発行して返す
 app.post("/programs", async (c) => {
+  const regOk = await checkRateLimit(c.env.DB, `register:program:${clientIp(c)}`, 5, 60 * 60 * 1000);
+  if (!regOk) return c.json({ error: "登録の試行回数が多すぎます。しばらく待ってから再度お試しください" }, 429);
+
   const body = await c.req.json().catch(() => null);
 
   if (!body || !body.companyName || !body.contactEmail || !body.scope || !body.description) {
     return c.json({ error: "必須項目が不足しています" }, 400);
+  }
+  if (!body.agreedToTerms) {
+    return c.json({ error: "利用規約とプライバシーポリシーへの同意が必要です" }, 400);
   }
 
   const existing = await c.env.DB.prepare(`SELECT id FROM programs WHERE contact_email = ?`).bind(body.contactEmail).first();
@@ -384,8 +450,8 @@ app.post("/programs", async (c) => {
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO programs (id, company_name, contact_email, scope, description, reward_min, reward_max, program_type, totp_secret, totp_confirmed, backup_codes, email_verified, email_code, email_code_expires, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?)`
+      `INSERT INTO programs (id, company_name, contact_email, scope, description, reward_min, reward_max, program_type, terms_agreed_at, totp_secret, totp_confirmed, backup_codes, email_verified, email_code, email_code_expires, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?)`
     )
       .bind(
         id,
@@ -396,6 +462,7 @@ app.post("/programs", async (c) => {
         Number(body.rewardMin) || 0,
         Number(body.rewardMax) || 0,
         programType,
+        createdAt,
         secret,
         JSON.stringify(hashedBackupCodes),
         emailCodeHash,
@@ -465,6 +532,9 @@ app.post("/programs/:id/confirm-totp", async (c) => {
   const body = await c.req.json().catch(() => null);
   if (!body || !body.code) return c.json({ error: "コードを入力してください" }, 400);
 
+  const ok1 = await checkRateLimit(c.env.DB, `totp-confirm:${id}`, 10, 15 * 60 * 1000);
+  if (!ok1) return c.json({ error: "試行回数が多すぎます。しばらく待ってから再度お試しください" }, 429);
+
   const row: any = await c.env.DB.prepare(`SELECT * FROM programs WHERE id = ?`).bind(id).first();
   if (!row) return c.json({ error: "not found" }, 404);
   if (!row.email_verified) return c.json({ error: "先にメールアドレスの確認を完了してください" }, 400);
@@ -481,7 +551,7 @@ app.post("/programs/:id/confirm-totp", async (c) => {
 app.get("/programs", async (c) => {
   try {
     const { results } = await c.env.DB.prepare(
-      `SELECT id, company_name, contact_email, scope, description, reward_min, reward_max, program_type, avatar_key, created_at
+      `SELECT id, company_name, scope, description, reward_min, reward_max, program_type, avatar_key, created_at
        FROM programs WHERE totp_confirmed = 1 AND email_verified = 1 ORDER BY created_at DESC`
     ).all();
     return c.json({ programs: results });
@@ -660,6 +730,9 @@ app.post("/hunters", async (c) => {
   if (!body || !body.handle || !body.email) {
     return c.json({ error: "ハンドルネームとメールアドレスは必須です" }, 400);
   }
+  if (!body.agreedToTerms) {
+    return c.json({ error: "利用規約とプライバシーポリシーへの同意が必要です" }, 400);
+  }
 
   const existing = await c.env.DB.prepare(`SELECT id FROM hunters WHERE email = ?`).bind(body.email).first();
   if (existing) {
@@ -677,8 +750,8 @@ app.post("/hunters", async (c) => {
 
   try {
     await c.env.DB.prepare(
-      `INSERT INTO hunters (id, handle, email, skills, portfolio, totp_secret, totp_confirmed, backup_codes, email_verified, email_code, email_code_expires, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?)`
+      `INSERT INTO hunters (id, handle, email, skills, portfolio, terms_agreed_at, totp_secret, totp_confirmed, backup_codes, email_verified, email_code, email_code_expires, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?)`
     )
       .bind(
         id,
@@ -686,6 +759,7 @@ app.post("/hunters", async (c) => {
         body.email,
         body.skills || null,
         body.portfolio || null,
+        createdAt,
         secret,
         JSON.stringify(hashedBackupCodes),
         emailCodeHash,
@@ -754,6 +828,9 @@ app.post("/hunters/:id/confirm-totp", async (c) => {
   const body = await c.req.json().catch(() => null);
   if (!body || !body.code) return c.json({ error: "コードを入力してください" }, 400);
 
+  const rateOk = await checkRateLimit(c.env.DB, `totp-confirm:${id}`, 10, 15 * 60 * 1000);
+  if (!rateOk) return c.json({ error: "試行回数が多すぎます。しばらく待ってから再度お試しください" }, 429);
+
   const row: any = await c.env.DB.prepare(`SELECT * FROM hunters WHERE id = ?`).bind(id).first();
   if (!row) return c.json({ error: "not found" }, 404);
   if (!row.email_verified) return c.json({ error: "先にメールアドレスの確認を完了してください" }, 400);
@@ -770,7 +847,7 @@ app.post("/hunters/:id/confirm-totp", async (c) => {
 app.get("/hunters", async (c) => {
   try {
     const { results } = await c.env.DB.prepare(
-      `SELECT id, handle, email, skills, portfolio, points, avatar_key, created_at
+      `SELECT id, handle, skills, portfolio, points, avatar_key, created_at
        FROM hunters WHERE totp_confirmed = 1 AND email_verified = 1 ORDER BY created_at DESC`
     ).all();
     return c.json({ hunters: results });
@@ -873,6 +950,9 @@ app.post("/reports", async (c) => {
   if (!user || user.userType !== "hunter") {
     return c.json({ error: "レポートの提出にはハンターとしてログインが必要です" }, 401);
   }
+
+  const reportsOk = await checkRateLimit(c.env.DB, `reports:${user.userId}`, 20, 60 * 60 * 1000);
+  if (!reportsOk) return c.json({ error: "レポートの提出回数が上限に達しました。しばらくしてから再度お試しください" }, 429);
 
   const body = await c.req.json().catch(() => null);
 
@@ -1095,6 +1175,9 @@ app.post("/reports/:id/comments", async (c) => {
   const { report, user } = await getAuthorizedReport(c, id);
   if (!report) return c.json({ error: "not found" }, 404);
   if (!user) return c.json({ error: "権限がありません" }, 403);
+
+  const commentsOk = await checkRateLimit(c.env.DB, `comments:${user.userType}:${user.userId}`, 60, 60 * 60 * 1000);
+  if (!commentsOk) return c.json({ error: "投稿回数が上限に達しました。しばらくしてから再度お試しください" }, 429);
 
   const body = await c.req.json().catch(() => null);
   if (!body || !body.message || !String(body.message).trim()) {
@@ -1510,6 +1593,9 @@ app.get("/admin/pre-registrations", async (c) => {
 
 // お問い合わせフォーム（認証不要、運営者にメール通知）
 app.post("/contact", async (c) => {
+  const contactOk = await checkRateLimit(c.env.DB, `contact:${clientIp(c)}`, 5, 60 * 60 * 1000);
+  if (!contactOk) return c.json({ error: "送信回数が上限に達しました。しばらくしてから再度お試しください" }, 429);
+
   const body = await c.req.json().catch(() => null);
   if (!body || !body.name || !body.email || !body.message) {
     return c.json({ error: "必須項目が不足しています" }, 400);
@@ -1553,6 +1639,9 @@ async function getAccountIdentity(db: D1Database, user: SessionUser): Promise<{ 
 app.post("/support/tickets", async (c) => {
   const user = await getSessionUser(c);
   if (!user) return c.json({ error: "ログインが必要です" }, 401);
+
+  const ticketsOk = await checkRateLimit(c.env.DB, `tickets:${user.userType}:${user.userId}`, 10, 60 * 60 * 1000);
+  if (!ticketsOk) return c.json({ error: "チケットの作成回数が上限に達しました。しばらくしてから再度お試しください" }, 429);
 
   const body = await c.req.json().catch(() => null);
   if (!body || !body.subject || !body.message) {
@@ -1641,6 +1730,9 @@ app.post("/support/tickets/:id/replies", async (c) => {
   const { ticket, user } = await getAuthorizedTicket(c, id);
   if (!ticket) return c.json({ error: "not found" }, 404);
   if (!user) return c.json({ error: "権限がありません" }, 403);
+
+  const replyOk = await checkRateLimit(c.env.DB, `ticket-replies:${user.userType}:${user.userId}`, 30, 60 * 60 * 1000);
+  if (!replyOk) return c.json({ error: "投稿回数が上限に達しました。しばらくしてから再度お試しください" }, 429);
 
   const body = await c.req.json().catch(() => null);
   if (!body || !body.message) {
