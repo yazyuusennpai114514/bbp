@@ -7,6 +7,7 @@ type Bindings = {
   ADMIN_KEY: string;
   PLATFORM_PAYPAL_LINK: string;
   RESEND_API_KEY: string;
+  BREVO_API_KEY: string;
 };
 
 type SessionUser = { userType: "hunter" | "program"; userId: string; actorType: "owner" | "member"; actorId: string | null };
@@ -183,11 +184,8 @@ function generateEmailCode(): string {
   return String(n).padStart(6, "0");
 }
 
-async function sendEmail(apiKey: string, to: string, subject: string, text: string): Promise<boolean> {
-  if (!apiKey || !to) {
-    console.error("RESEND_API_KEY or recipient missing; skipping email send");
-    return false;
-  }
+async function sendViaResend(apiKey: string, to: string, subject: string, text: string): Promise<boolean> {
+  if (!apiKey) return false;
   try {
     const res = await fetch("https://api.resend.com/emails", {
       method: "POST",
@@ -202,6 +200,7 @@ async function sendEmail(apiKey: string, to: string, subject: string, text: stri
         text,
       }),
     });
+    if (!res.ok) console.error("Resend send failed:", res.status, await res.text().catch(() => ""));
     return res.ok;
   } catch (err) {
     console.error("Resend send error:", err);
@@ -209,9 +208,48 @@ async function sendEmail(apiKey: string, to: string, subject: string, text: stri
   }
 }
 
-async function sendVerificationEmail(apiKey: string, to: string, code: string): Promise<boolean> {
+async function sendViaBrevo(apiKey: string, to: string, subject: string, text: string): Promise<boolean> {
+  if (!apiKey) return false;
+  try {
+    const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        "api-key": apiKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        sender: { name: "bughunter.uk", email: "no-reply@bughunter.uk" },
+        to: [{ email: to }],
+        subject,
+        textContent: text,
+      }),
+    });
+    if (!res.ok) console.error("Brevo send failed:", res.status, await res.text().catch(() => ""));
+    return res.ok;
+  } catch (err) {
+    console.error("Brevo send error:", err);
+    return false;
+  }
+}
+
+// Resendでの送信を優先し、失敗した場合（上限到達・エラー等）は自動でBrevoにフォールバックする
+async function sendEmail(env: { RESEND_API_KEY: string; BREVO_API_KEY: string }, to: string, subject: string, text: string): Promise<boolean> {
+  if (!to) {
+    console.error("recipient missing; skipping email send");
+    return false;
+  }
+
+  const viaResend = await sendViaResend(env.RESEND_API_KEY, to, subject, text);
+  if (viaResend) return true;
+
+  console.error("Falling back to Brevo for:", to);
+  const viaBrevo = await sendViaBrevo(env.BREVO_API_KEY, to, subject, text);
+  return viaBrevo;
+}
+
+async function sendVerificationEmail(env: { RESEND_API_KEY: string; BREVO_API_KEY: string }, to: string, code: string): Promise<boolean> {
   return sendEmail(
-    apiKey,
+    env,
     to,
     `【bughunter.uk】確認コード: ${code}`,
     `以下の確認コードをサイトに入力してください。\n\n確認コード: ${code}\n\nこのコードの有効期限は15分です。心当たりがない場合はこのメールを無視してください。`
@@ -471,7 +509,7 @@ app.post("/programs", async (c) => {
       )
       .run();
 
-    const emailSent = await sendVerificationEmail(c.env.RESEND_API_KEY, body.contactEmail, emailCode);
+    const emailSent = await sendVerificationEmail(c.env, body.contactEmail, emailCode);
     const otpauthUrl = `otpauth://totp/BBP:${encodeURIComponent(body.contactEmail)}?secret=${secret}&issuer=BBP&algorithm=SHA1&digits=6&period=30`;
     return c.json({ received: true, id, createdAt, secret, otpauthUrl, backupCodes, emailSent });
   } catch (err: any) {
@@ -522,7 +560,7 @@ app.post("/programs/:id/resend-email-code", async (c) => {
     .bind(emailCodeHash, emailCodeExpires, id)
     .run();
 
-  const emailSent = await sendVerificationEmail(c.env.RESEND_API_KEY, row.contact_email, emailCode);
+  const emailSent = await sendVerificationEmail(c.env, row.contact_email, emailCode);
   return c.json({ sent: emailSent });
 });
 
@@ -658,7 +696,7 @@ app.post("/programs/:id/members", async (c) => {
       .run();
 
     await sendEmail(
-      c.env.RESEND_API_KEY,
+      c.env,
       body.email,
       `【bughunter.uk】チームメンバーとして追加されました`,
       `bughunter.uk のチームメンバーとして追加されました。\n\nログイン用の認証アプリ設定（QRコード・バックアップコード）は、追加した担当者から直接お受け取りください。\n\nログイン画面で「企業」を選び、このメールアドレスとログイン先から共有される認証コードでログインできます。`
@@ -768,7 +806,7 @@ app.post("/hunters", async (c) => {
       )
       .run();
 
-    const emailSent = await sendVerificationEmail(c.env.RESEND_API_KEY, body.email, emailCode);
+    const emailSent = await sendVerificationEmail(c.env, body.email, emailCode);
     const otpauthUrl = `otpauth://totp/BBP:${encodeURIComponent(body.email)}?secret=${secret}&issuer=BBP&algorithm=SHA1&digits=6&period=30`;
     return c.json({ received: true, id, createdAt, secret, otpauthUrl, backupCodes, emailSent });
   } catch (err: any) {
@@ -819,7 +857,7 @@ app.post("/hunters/:id/resend-email-code", async (c) => {
     .bind(emailCodeHash, emailCodeExpires, id)
     .run();
 
-  const emailSent = await sendVerificationEmail(c.env.RESEND_API_KEY, row.email, emailCode);
+  const emailSent = await sendVerificationEmail(c.env, row.email, emailCode);
   return c.json({ sent: emailSent });
 });
 
@@ -982,7 +1020,7 @@ app.post("/reports", async (c) => {
 
     if (targetProgram) {
       await sendEmail(
-        c.env.RESEND_API_KEY,
+        c.env,
         targetProgram.contact_email,
         `【bughunter.uk】新しいレポートが届きました: ${body.title}`,
         `${targetProgram.company_name} 宛に新しい脆弱性レポートが提出されました。\n\nタイトル: ${body.title}\n重大度: ${body.severity}\n\nサイトにログインして内容を確認してください。`
@@ -1108,7 +1146,7 @@ app.post("/hunters/:id/request-payout", async (c) => {
 
   if (settings.adminEmail) {
     await sendEmail(
-      c.env.RESEND_API_KEY,
+      c.env,
       settings.adminEmail,
       `【bughunter.uk】支払い申請: ${hunterRow?.handle || id}`,
       `ハンター「${hunterRow?.handle || id}」から支払い申請がありました。\n\n未払い合計（手数料差引後）: ¥${totalNet.toLocaleString()}\nPayPal受け取り先: ${hunterRow?.paypal_link || "未登録"}\n\n管理画面の「支払い待ち」から詳細を確認し、送金後は「支払い済みにする」を押してください。`
@@ -1201,7 +1239,7 @@ app.post("/reports/:id/comments", async (c) => {
         .first();
       if (program) {
         await sendEmail(
-          c.env.RESEND_API_KEY,
+          c.env,
           program.contact_email,
           `【bughunter.uk】レポートに返信がありました: ${report.title}`,
           `ハンターから返信がありました。\n\nレポート: ${report.title}\n\nサイトにログインして内容を確認してください。`
@@ -1213,7 +1251,7 @@ app.post("/reports/:id/comments", async (c) => {
         .first();
       if (hunter) {
         await sendEmail(
-          c.env.RESEND_API_KEY,
+          c.env,
           hunter.email,
           `【bughunter.uk】レポートに返信がありました: ${report.title}`,
           `企業から返信がありました。\n\nレポート: ${report.title}\n\nサイトにログインして内容を確認してください。`
@@ -1305,7 +1343,7 @@ app.patch("/reports/:id", async (c) => {
       const hunter: any = await c.env.DB.prepare(`SELECT email FROM hunters WHERE id = ?`).bind(report.hunter_id).first();
       if (hunter) {
         await sendEmail(
-          c.env.RESEND_API_KEY,
+          c.env,
           hunter.email,
           `【bughunter.uk】レポートのステータスが更新されました: ${report.title}`,
           `レポート「${report.title}」のステータスが「${body.status}」に更新されました。\n\nサイトにログインして詳細を確認してください。`
@@ -1498,7 +1536,7 @@ app.patch("/admin/reports/:id/paid", async (c) => {
       const hunter: any = await c.env.DB.prepare(`SELECT email FROM hunters WHERE id = ?`).bind(report.hunter_id).first();
       if (hunter) {
         await sendEmail(
-          c.env.RESEND_API_KEY,
+          c.env,
           hunter.email,
           `【bughunter.uk】報奨金の支払いが完了しました: ${report.title}`,
           `レポート「${report.title}」の報奨金（¥${Number(report.reward_amount || 0).toLocaleString()}）の送金が完了しました。\n\nPayPalをご確認ください。`
@@ -1610,7 +1648,7 @@ app.post("/contact", async (c) => {
   }
 
   const sent = await sendEmail(
-    c.env.RESEND_API_KEY,
+    c.env,
     settings.adminEmail,
     `【bughunter.uk】お問い合わせ: ${body.name}`,
     `名前: ${body.name}\nメールアドレス: ${body.email}\n\n${body.message}`
@@ -1668,14 +1706,14 @@ app.post("/support/tickets", async (c) => {
     const settings = await getPlatformSettings(c.env.DB, c.env.PLATFORM_PAYPAL_LINK);
     if (settings.adminEmail) {
       await sendEmail(
-        c.env.RESEND_API_KEY,
+        c.env,
         settings.adminEmail,
         `【bughunter.uk】新しいサポートチケット: ${body.subject}`,
         `${identity.name}（${identity.email} / ${user.userType === "hunter" ? "ハンター" : "企業"}）からチケットが届きました。\n\n件名: ${body.subject}\n\n${body.message}\n\n管理画面から返信してください。チケットID: ${id}`
       );
     }
     await sendEmail(
-      c.env.RESEND_API_KEY,
+      c.env,
       identity.email,
       `【bughunter.uk】お問い合わせを受け付けました: ${body.subject}`,
       `お問い合わせありがとうございます。以下の内容で受け付けました。\n\n件名: ${body.subject}\n\n${body.message}\n\nサイトにログインし、マイチケットから対応状況を確認できます。`
@@ -1750,7 +1788,7 @@ app.post("/support/tickets/:id/replies", async (c) => {
   const settings = await getPlatformSettings(c.env.DB, c.env.PLATFORM_PAYPAL_LINK);
   if (settings.adminEmail) {
     await sendEmail(
-      c.env.RESEND_API_KEY,
+      c.env,
       settings.adminEmail,
       `【bughunter.uk】チケットに追記がありました: ${ticket.subject}`,
       `${ticket.name} からチケットに追記がありました。\n\nチケットID: ${id}\n\n${body.message}`
@@ -1813,7 +1851,7 @@ app.post("/admin/support/tickets/:id/replies", async (c) => {
   }
 
   await sendEmail(
-    c.env.RESEND_API_KEY,
+    c.env,
     ticket.email,
     `【bughunter.uk】お問い合わせに返信がありました: ${ticket.subject}`,
     `お問い合わせ「${ticket.subject}」に返信がありました。\n\n${body.message}\n\nチケットID: ${id}\nサイトのチケット確認ページから続きをご覧いただけます。`
