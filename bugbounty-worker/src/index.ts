@@ -8,6 +8,7 @@ type Bindings = {
   PLATFORM_PAYPAL_LINK: string;
   RESEND_API_KEY: string;
   BREVO_API_KEY: string;
+  ANTHROPIC_API_KEY: string;
 };
 
 type SessionUser = { userType: "hunter" | "program"; userId: string; actorType: "owner" | "member"; actorId: string | null };
