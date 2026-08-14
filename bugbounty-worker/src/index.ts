@@ -9,6 +9,10 @@ type Bindings = {
   RESEND_API_KEY: string;
   BREVO_API_KEY: string;
   ANTHROPIC_API_KEY: string;
+  DIDIT_API_KEY: string;
+  DIDIT_WEBHOOK_SECRET: string;
+  DIDIT_WORKFLOW_ID_HUNTER: string;
+  DIDIT_WORKFLOW_ID_COMPANY: string;
 };
 
 type SessionUser = { userType: "hunter" | "program"; userId: string; actorType: "owner" | "member"; actorId: string | null };
@@ -258,8 +262,154 @@ async function sendVerificationEmail(env: { RESEND_API_KEY: string; BREVO_API_KE
 }
 
 // =====================================================
-// セッション
+// Didit（本人確認 / 企業確認）
 // =====================================================
+
+// Diditのホスト型セッションを作成し、ユーザーを飛ばす先のURLを返す
+async function createDiditSession(
+  apiKey: string,
+  workflowId: string,
+  vendorData: string,
+  callbackUrl: string
+): Promise<{ sessionId: string; url: string } | null> {
+  if (!apiKey || !workflowId) {
+    console.error("Didit API key or workflow_id is not set");
+    return null;
+  }
+  try {
+    const res = await fetch("https://verification.didit.me/v3/session/", {
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        workflow_id: workflowId,
+        vendor_data: vendorData,
+        callback: callbackUrl,
+      }),
+    });
+    if (!res.ok) {
+      console.error("Didit session create failed:", res.status, await res.text().catch(() => ""));
+      return null;
+    }
+    const data: any = await res.json();
+    const url = data.url || data.verification_url;
+    const sessionId = data.session_id || data.id;
+    if (!url || !sessionId) {
+      console.error("Didit session response missing url/session_id:", JSON.stringify(data));
+      return null;
+    }
+    return { sessionId, url };
+  } catch (err) {
+    console.error("Didit session create error:", err);
+    return null;
+  }
+}
+
+// HMAC-SHA256でX-Signature-V2を検証する（生のリクエストボディに対して計算）
+async function verifyDiditSignature(secret: string, rawBody: string, signatureHeader: string | null): Promise<boolean> {
+  if (!secret || !signatureHeader) return false;
+  try {
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const sigBuffer = await crypto.subtle.sign("HMAC", key, enc.encode(rawBody));
+    const computedHex = Array.from(new Uint8Array(sigBuffer))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    // タイミング攻撃対策のため定数時間で比較
+    const a = enc.encode(computedHex);
+    const b = enc.encode(signatureHeader.trim().toLowerCase());
+    if (a.length !== b.length) return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+    return diff === 0;
+  } catch (err) {
+    console.error("Didit signature verify error:", err);
+    return false;
+  }
+}
+
+// Diditのステータス文字列を、このサービス内部の verification_status にマッピングする
+function mapDiditStatus(status: string): "verified" | "rejected" | "pending" | "none" {
+  const s = (status || "").toLowerCase();
+  if (s === "approved") return "verified";
+  if (s === "declined") return "rejected";
+  if (s === "in review" || s === "in_review" || s === "not started" || s === "not_started" || s === "in progress" || s === "in_progress") return "pending";
+  return "none"; // abandoned など
+}
+
+// =====================================================
+// Didit Webhook（ステータス更新の受信）
+// =====================================================
+
+app.post("/webhooks/didit", async (c) => {
+  const rawBody = await c.req.text();
+  const signature = c.req.header("X-Signature") || c.req.header("x-signature");
+
+  const valid = await verifyDiditSignature(c.env.DIDIT_WEBHOOK_SECRET, rawBody, signature);
+  if (!valid) {
+    console.error("Didit webhook signature verification failed");
+    return c.json({ error: "invalid signature" }, 401);
+  }
+
+  let payload: any;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch (err) {
+    return c.json({ error: "invalid payload" }, 400);
+  }
+
+  const sessionId: string | undefined = payload.session_id;
+  const status: string | undefined = payload.status;
+  if (!sessionId || !status) {
+    return c.json({ error: "missing session_id or status" }, 400);
+  }
+
+  const mapped = mapDiditStatus(status);
+
+  const session: any = await c.env.DB.prepare(`SELECT * FROM didit_sessions WHERE session_id = ?`).bind(sessionId).first();
+  if (!session) {
+    console.error("Didit webhook: unknown session_id", sessionId);
+    return c.json({ received: true }); // 200で応答しないとDidit側がリトライし続けるため
+  }
+
+  const table = session.entity_type === "hunter" ? "hunters" : "programs";
+  await c.env.DB.prepare(`UPDATE ${table} SET verification_status = ? WHERE id = ?`).bind(mapped, session.entity_id).run();
+
+  // 結果をメールで通知
+  try {
+    if (session.entity_type === "hunter") {
+      const hunter: any = await c.env.DB.prepare(`SELECT email, handle FROM hunters WHERE id = ?`).bind(session.entity_id).first();
+      if (hunter && (mapped === "verified" || mapped === "rejected")) {
+        await sendEmail(
+          c.env,
+          hunter.email,
+          `【bughunter.uk】本人確認の結果: ${mapped === "verified" ? "承認されました" : "却下されました"}`,
+          mapped === "verified"
+            ? "本人確認が承認されました。非公開プログラムの閲覧・応募が可能になりました。"
+            : "本人確認が却下されました。お手数ですが、マイページから再度お申し込みください。"
+        );
+      }
+    } else {
+      const program: any = await c.env.DB.prepare(`SELECT contact_email, company_name FROM programs WHERE id = ?`).bind(session.entity_id).first();
+      if (program && (mapped === "verified" || mapped === "rejected")) {
+        await sendEmail(
+          c.env,
+          program.contact_email,
+          `【bughunter.uk】企業確認の結果: ${mapped === "verified" ? "承認されました" : "却下されました"}`,
+          mapped === "verified"
+            ? "企業確認が承認されました。非公開プログラムを作成できるようになりました。"
+            : "企業確認が却下されました。お手数ですが、マイページから再度お申し込みください。"
+        );
+      }
+    }
+  } catch (err) {
+    console.error("Didit webhook notification email error:", err);
+  }
+
+  return c.json({ received: true });
+});
 
 const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -301,6 +451,65 @@ const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 const ALLOWED_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 app.get("/", (c) => c.json({ status: "ok", message: "BBP API is running" }));
+
+// Diditからのwebhook受信（本人確認・企業確認の結果を受け取る）
+app.post("/webhooks/didit", async (c) => {
+  const rawBody = await c.req.text();
+  const signature = c.req.header("X-Signature-V2") || c.req.header("x-signature-v2");
+
+  const ok = await verifyDiditSignature(c.env.DIDIT_WEBHOOK_SECRET, rawBody, signature || null);
+  if (!ok) {
+    console.error("Didit webhook signature verification failed");
+    return c.json({ error: "invalid signature" }, 401);
+  }
+
+  let payload: any;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch {
+    return c.json({ error: "invalid json" }, 400);
+  }
+
+  const sessionId: string | undefined = payload.session_id;
+  const status: string | undefined = payload.status || payload.decision?.status;
+  if (!sessionId || !status) {
+    return c.json({ error: "missing session_id or status" }, 400);
+  }
+
+  const sessionRow: any = await c.env.DB.prepare(`SELECT * FROM didit_sessions WHERE session_id = ?`).bind(sessionId).first();
+  if (!sessionRow) {
+    console.error("Didit webhook: unknown session_id", sessionId);
+    return c.json({ received: true }); // 200を返し、Diditの不要なリトライを防ぐ
+  }
+
+  const mappedStatus = mapDiditStatus(status);
+  const table = sessionRow.entity_type === "hunter" ? "hunters" : "programs";
+
+  await c.env.DB.prepare(`UPDATE ${table} SET verification_status = ? WHERE id = ?`)
+    .bind(mappedStatus, sessionRow.entity_id)
+    .run();
+
+  // 承認・却下時は本人にメール通知
+  if (mappedStatus === "verified" || mappedStatus === "rejected") {
+    const emailCol = sessionRow.entity_type === "hunter" ? "email" : "contact_email";
+    const row: any = await c.env.DB.prepare(`SELECT ${emailCol} as email FROM ${table} WHERE id = ?`)
+      .bind(sessionRow.entity_id)
+      .first();
+    if (row?.email) {
+      const label = sessionRow.entity_type === "hunter" ? "本人確認" : "企業確認";
+      await sendEmail(
+        c.env,
+        row.email,
+        `【bughunter.uk】${label}の結果: ${mappedStatus === "verified" ? "承認されました" : "承認されませんでした"}`,
+        mappedStatus === "verified"
+          ? `${label}が完了しました。サイトにログインしてご確認ください。`
+          : `${label}が承認されませんでした。詳細はサイトにログインの上、サポートチケットからお問い合わせください。`
+      );
+    }
+  }
+
+  return c.json({ received: true });
+});
 
 // プラットフォーム設定（PayPal送金先・手数料率）をD1から読む。未設定・テーブル未作成ならフォールバック
 async function getPlatformSettings(db: D1Database, envFallbackLink?: string) {
@@ -426,8 +635,8 @@ app.get("/auth/me", async (c) => {
   const table = user.userType === "hunter" ? "hunters" : "programs";
   const cols =
     user.userType === "hunter"
-      ? "id, handle, email, skills, portfolio, paypal_link, points, avatar_key, created_at"
-      : "id, company_name, contact_email, scope, description, reward_min, reward_max, program_type, avatar_key, created_at";
+      ? "id, handle, email, skills, portfolio, paypal_link, points, verification_status, avatar_key, created_at"
+      : "id, company_name, contact_email, scope, description, reward_min, reward_max, program_type, verification_status, is_private, avatar_key, created_at";
 
   const row: any = await c.env.DB.prepare(`SELECT ${cols} FROM ${table} WHERE id = ?`).bind(user.userId).first();
   if (!row) return c.json({ error: "not found" }, 404);
@@ -438,10 +647,19 @@ app.get("/auth/me", async (c) => {
     actingMemberName = member?.name || null;
   }
 
+  let canStartVerification = false;
+  if (user.userType === "hunter" && row.verification_status !== "verified" && row.verification_status !== "pending") {
+    const hasValidReport = await c.env.DB.prepare(`SELECT 1 FROM reports WHERE hunter_id = ? AND status = '解決済み' LIMIT 1`)
+      .bind(user.userId)
+      .first();
+    canStartVerification = !!hasValidReport;
+  }
+
   return c.json({
     userType: user.userType,
     isOwner: user.actorType === "owner",
     actingMemberName,
+    canStartVerification,
     ...row,
   });
 });
@@ -590,10 +808,23 @@ app.post("/programs/:id/confirm-totp", async (c) => {
 app.get("/programs", async (c) => {
   try {
     const { results } = await c.env.DB.prepare(
-      `SELECT id, company_name, scope, description, reward_min, reward_max, program_type, avatar_key, created_at
+      `SELECT id, company_name, scope, description, reward_min, reward_max, program_type, verification_status, is_private, avatar_key, created_at
        FROM programs WHERE totp_confirmed = 1 AND email_verified = 1 ORDER BY created_at DESC`
     ).all();
-    return c.json({ programs: results });
+
+    const rows = results as any[];
+    const hasPrivate = rows.some((p) => p.is_private);
+    let hunterVerified = false;
+    if (hasPrivate) {
+      const user = await getSessionUser(c);
+      if (user && user.userType === "hunter") {
+        const hunter: any = await c.env.DB.prepare(`SELECT verification_status FROM hunters WHERE id = ?`).bind(user.userId).first();
+        hunterVerified = hunter?.verification_status === "verified";
+      }
+    }
+
+    const visible = hunterVerified ? rows : rows.filter((p) => !p.is_private);
+    return c.json({ programs: visible });
   } catch (err) {
     console.error("D1 select error:", err);
     return c.json({ error: "取得に失敗しました" }, 500);
@@ -624,6 +855,15 @@ app.patch("/programs/:id", async (c) => {
     return c.json({ error: "報奨金の下限は上限以下にしてください" }, 400);
   }
 
+  let isPrivate: number | null = null;
+  if (body.isPrivate !== undefined) {
+    const row: any = await c.env.DB.prepare(`SELECT verification_status FROM programs WHERE id = ?`).bind(id).first();
+    if (body.isPrivate && row?.verification_status !== "verified") {
+      return c.json({ error: "非公開プログラムにするには、企業確認（KYB）の完了が必要です" }, 403);
+    }
+    isPrivate = body.isPrivate ? 1 : 0;
+  }
+
   try {
     await c.env.DB.prepare(
       `UPDATE programs SET
@@ -631,10 +871,11 @@ app.patch("/programs/:id", async (c) => {
          scope = COALESCE(?, scope),
          description = COALESCE(?, description),
          reward_min = COALESCE(?, reward_min),
-         reward_max = COALESCE(?, reward_max)
+         reward_max = COALESCE(?, reward_max),
+         is_private = COALESCE(?, is_private)
        WHERE id = ?`
     )
-      .bind(companyName, scope, description, rewardMin, rewardMax, id)
+      .bind(companyName, scope, description, rewardMin, rewardMax, isPrivate, id)
       .run();
 
     return c.json({ updated: true });
@@ -642,6 +883,42 @@ app.patch("/programs/:id", async (c) => {
     console.error("D1 update error:", err);
     return c.json({ error: "更新に失敗しました" }, 500);
   }
+});
+
+// 企業確認（Didit KYB）を開始する
+app.post("/programs/:id/start-verification", async (c) => {
+  const id = c.req.param("id");
+  const user = await getSessionUser(c);
+  if (!user || user.userType !== "program" || user.userId !== id || user.actorType !== "owner") {
+    return c.json({ error: "権限がありません（オーナーのみ申請できます）" }, 403);
+  }
+
+  const program: any = await c.env.DB.prepare(`SELECT verification_status FROM programs WHERE id = ?`).bind(id).first();
+  if (program?.verification_status === "verified") {
+    return c.json({ error: "すでに企業確認済みです" }, 400);
+  }
+  if (program?.verification_status === "pending") {
+    return c.json({ error: "企業確認を審査中です。しばらくお待ちください" }, 400);
+  }
+
+  const session = await createDiditSession(
+    c.env.DIDIT_API_KEY,
+    c.env.DIDIT_WORKFLOW_ID_COMPANY,
+    `program:${id}`,
+    "https://bughunter.uk/?tab=myprofile"
+  );
+  if (!session) {
+    return c.json({ error: "企業確認セッションの作成に失敗しました。時間をおいて再度お試しください" }, 500);
+  }
+
+  await c.env.DB.prepare(
+    `INSERT INTO didit_sessions (session_id, entity_type, entity_id, created_at) VALUES (?, 'program', ?, ?)`
+  )
+    .bind(session.sessionId, id, Date.now())
+    .run();
+  await c.env.DB.prepare(`UPDATE programs SET verification_status = 'pending' WHERE id = ?`).bind(id).run();
+
+  return c.json({ url: session.url });
 });
 
 // =====================================================
@@ -1003,10 +1280,17 @@ app.post("/reports", async (c) => {
     return c.json({ error: "severityの値が不正です" }, 400);
   }
 
-  const targetProgram: any = await c.env.DB.prepare(`SELECT company_name, contact_email FROM programs WHERE id = ?`)
+  const targetProgram: any = await c.env.DB.prepare(`SELECT company_name, contact_email, is_private FROM programs WHERE id = ?`)
     .bind(body.programId)
     .first();
   if (!targetProgram) return c.json({ error: "プログラムが見つかりません" }, 404);
+
+  if (targetProgram.is_private) {
+    const hunter: any = await c.env.DB.prepare(`SELECT verification_status FROM hunters WHERE id = ?`).bind(user.userId).first();
+    if (hunter?.verification_status !== "verified") {
+      return c.json({ error: "このプログラムは非公開です。本人確認（KYC）を完了したハンターのみレポートを提出できます" }, 403);
+    }
+  }
 
   const id = crypto.randomUUID();
   const createdAt = Date.now();
@@ -1082,6 +1366,53 @@ app.get("/hunters/:id/reports", async (c) => {
     return c.json({ error: "取得に失敗しました" }, 500);
   }
 });
+
+// 本人確認（Didit）を開始する。解決済みレポートが1件以上ないと申請できない
+app.post("/hunters/:id/start-verification", async (c) => {
+  const id = c.req.param("id");
+  const user = await getSessionUser(c);
+  if (!user || user.userType !== "hunter" || user.userId !== id) {
+    return c.json({ error: "権限がありません" }, 403);
+  }
+
+  const hasValidReport = await c.env.DB.prepare(
+    `SELECT 1 FROM reports WHERE hunter_id = ? AND status = '解決済み' LIMIT 1`
+  )
+    .bind(id)
+    .first();
+  if (!hasValidReport) {
+    return c.json({ error: "本人確認には「解決済み」ステータスのレポートが1件以上必要です" }, 403);
+  }
+
+  const hunter: any = await c.env.DB.prepare(`SELECT verification_status FROM hunters WHERE id = ?`).bind(id).first();
+  if (hunter?.verification_status === "verified") {
+    return c.json({ error: "すでに本人確認済みです" }, 400);
+  }
+  if (hunter?.verification_status === "pending") {
+    return c.json({ error: "本人確認を審査中です。しばらくお待ちください" }, 400);
+  }
+
+  const session = await createDiditSession(
+    c.env.DIDIT_API_KEY,
+    c.env.DIDIT_WORKFLOW_ID_HUNTER,
+    `hunter:${id}`,
+    "https://bughunter.uk/?tab=myprofile"
+  );
+  if (!session) {
+    return c.json({ error: "本人確認セッションの作成に失敗しました。時間をおいて再度お試しください" }, 500);
+  }
+
+  await c.env.DB.prepare(
+    `INSERT INTO didit_sessions (session_id, entity_type, entity_id, created_at) VALUES (?, 'hunter', ?, ?)`
+  )
+    .bind(session.sessionId, id, Date.now())
+    .run();
+  await c.env.DB.prepare(`UPDATE hunters SET verification_status = 'pending' WHERE id = ?`).bind(id).run();
+
+  return c.json({ url: session.url });
+});
+
+
 
 const PAYOUT_REQUEST_THRESHOLD = 5000;
 
