@@ -31,7 +31,7 @@ const ALLOWED_ORIGINS = [
 app.use(
   "*",
   cors({
-    origin: (origin) => (origin && ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0]),
+    origin: "*",
     allowHeaders: ["Content-Type", "Authorization", "X-Admin-Key"],
   })
 );
