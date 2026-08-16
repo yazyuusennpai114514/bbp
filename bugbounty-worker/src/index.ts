@@ -12,7 +12,6 @@ type Bindings = {
   DIDIT_API_KEY: string;
   DIDIT_WEBHOOK_SECRET: string;
   DIDIT_WORKFLOW_ID_HUNTER: string;
-  DIDIT_WORKFLOW_ID_COMPANY: string;
 };
 
 type SessionUser = { userType: "hunter" | "program"; userId: string; actorType: "owner" | "member"; actorId: string | null };
@@ -649,7 +648,7 @@ app.get("/auth/me", async (c) => {
 
   let canStartVerification = false;
   if (user.userType === "hunter" && row.verification_status !== "verified" && row.verification_status !== "pending") {
-    const hasValidReport = await c.env.DB.prepare(`SELECT 1 FROM reports WHERE hunter_id = ? AND status = '解決済み' LIMIT 1`)
+    const hasValidReport = await c.env.DB.prepare(`SELECT 1 FROM reports WHERE hunter_id = ? AND status = 'トリアージ' LIMIT 1`)
       .bind(user.userId)
       .first();
     canStartVerification = !!hasValidReport;
@@ -855,14 +854,7 @@ app.patch("/programs/:id", async (c) => {
     return c.json({ error: "報奨金の下限は上限以下にしてください" }, 400);
   }
 
-  let isPrivate: number | null = null;
-  if (body.isPrivate !== undefined) {
-    const row: any = await c.env.DB.prepare(`SELECT verification_status FROM programs WHERE id = ?`).bind(id).first();
-    if (body.isPrivate && row?.verification_status !== "verified") {
-      return c.json({ error: "非公開プログラムにするには、企業確認（KYB）の完了が必要です" }, 403);
-    }
-    isPrivate = body.isPrivate ? 1 : 0;
-  }
+  const isPrivate: number | null = body.isPrivate !== undefined ? (body.isPrivate ? 1 : 0) : null;
 
   try {
     await c.env.DB.prepare(
@@ -883,42 +875,6 @@ app.patch("/programs/:id", async (c) => {
     console.error("D1 update error:", err);
     return c.json({ error: "更新に失敗しました" }, 500);
   }
-});
-
-// 企業確認（Didit KYB）を開始する
-app.post("/programs/:id/start-verification", async (c) => {
-  const id = c.req.param("id");
-  const user = await getSessionUser(c);
-  if (!user || user.userType !== "program" || user.userId !== id || user.actorType !== "owner") {
-    return c.json({ error: "権限がありません（オーナーのみ申請できます）" }, 403);
-  }
-
-  const program: any = await c.env.DB.prepare(`SELECT verification_status FROM programs WHERE id = ?`).bind(id).first();
-  if (program?.verification_status === "verified") {
-    return c.json({ error: "すでに企業確認済みです" }, 400);
-  }
-  if (program?.verification_status === "pending") {
-    return c.json({ error: "企業確認を審査中です。しばらくお待ちください" }, 400);
-  }
-
-  const session = await createDiditSession(
-    c.env.DIDIT_API_KEY,
-    c.env.DIDIT_WORKFLOW_ID_COMPANY,
-    `program:${id}`,
-    "https://bughunter.uk/?tab=myprofile"
-  );
-  if (!session) {
-    return c.json({ error: "企業確認セッションの作成に失敗しました。時間をおいて再度お試しください" }, 500);
-  }
-
-  await c.env.DB.prepare(
-    `INSERT INTO didit_sessions (session_id, entity_type, entity_id, created_at) VALUES (?, 'program', ?, ?)`
-  )
-    .bind(session.sessionId, id, Date.now())
-    .run();
-  await c.env.DB.prepare(`UPDATE programs SET verification_status = 'pending' WHERE id = ?`).bind(id).run();
-
-  return c.json({ url: session.url });
 });
 
 // =====================================================
@@ -1376,12 +1332,12 @@ app.post("/hunters/:id/start-verification", async (c) => {
   }
 
   const hasValidReport = await c.env.DB.prepare(
-    `SELECT 1 FROM reports WHERE hunter_id = ? AND status = '解決済み' LIMIT 1`
+    `SELECT 1 FROM reports WHERE hunter_id = ? AND status = 'トリアージ' LIMIT 1`
   )
     .bind(id)
     .first();
   if (!hasValidReport) {
-    return c.json({ error: "本人確認には「解決済み」ステータスのレポートが1件以上必要です" }, 403);
+    return c.json({ error: "本人確認には「トリアージ」ステータスのレポートが1件以上必要です" }, 403);
   }
 
   const hunter: any = await c.env.DB.prepare(`SELECT verification_status FROM hunters WHERE id = ?`).bind(id).first();
