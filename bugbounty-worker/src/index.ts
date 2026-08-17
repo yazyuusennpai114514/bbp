@@ -188,6 +188,14 @@ function generateEmailCode(): string {
   return String(n).padStart(6, "0");
 }
 
+// メールアドレスの形式チェック（ローカル部@ドメイン.TLD の最低限の形式のみ許可）
+function isValidEmail(email: unknown): email is string {
+  if (typeof email !== "string") return false;
+  const trimmed = email.trim();
+  if (trimmed.length === 0 || trimmed.length > 254) return false;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed);
+}
+
 async function sendViaResend(apiKey: string, to: string, subject: string, text: string): Promise<boolean> {
   if (!apiKey) return false;
   try {
@@ -236,19 +244,19 @@ async function sendViaBrevo(apiKey: string, to: string, subject: string, text: s
   }
 }
 
-// Resendでの送信を優先し、失敗した場合（上限到達・エラー等）は自動でBrevoにフォールバックする
+// Brevoでの送信を優先し、失敗した場合（上限到達・エラー等）は自動でResendにフォールバックする
 async function sendEmail(env: { RESEND_API_KEY: string; BREVO_API_KEY: string }, to: string, subject: string, text: string): Promise<boolean> {
   if (!to) {
     console.error("recipient missing; skipping email send");
     return false;
   }
 
-  const viaResend = await sendViaResend(env.RESEND_API_KEY, to, subject, text);
-  if (viaResend) return true;
-
-  console.error("Falling back to Brevo for:", to);
   const viaBrevo = await sendViaBrevo(env.BREVO_API_KEY, to, subject, text);
-  return viaBrevo;
+  if (viaBrevo) return true;
+
+  console.error("Falling back to Resend for:", to);
+  const viaResend = await sendViaResend(env.RESEND_API_KEY, to, subject, text);
+  return viaResend;
 }
 
 async function sendVerificationEmail(env: { RESEND_API_KEY: string; BREVO_API_KEY: string }, to: string, code: string): Promise<boolean> {
@@ -685,6 +693,9 @@ app.post("/programs", async (c) => {
   if (!body || !body.companyName || !body.contactEmail || !body.scope || !body.description) {
     return c.json({ error: "必須項目が不足しています" }, 400);
   }
+  if (!isValidEmail(body.contactEmail)) {
+    return c.json({ error: "メールアドレスの形式が正しくありません" }, 400);
+  }
   if (!body.agreedToTerms) {
     return c.json({ error: "利用規約とプライバシーポリシーへの同意が必要です" }, 400);
   }
@@ -909,6 +920,9 @@ app.post("/programs/:id/members", async (c) => {
   if (!body || !body.name || !body.email) {
     return c.json({ error: "名前とメールアドレスは必須です" }, 400);
   }
+  if (!isValidEmail(body.email)) {
+    return c.json({ error: "メールアドレスの形式が正しくありません" }, 400);
+  }
 
   const existingProgram = await c.env.DB.prepare(`SELECT id FROM programs WHERE contact_email = ?`).bind(body.email).first();
   const existingMember = await c.env.DB.prepare(`SELECT id FROM program_members WHERE email = ?`).bind(body.email).first();
@@ -1001,6 +1015,9 @@ app.post("/hunters", async (c) => {
 
   if (!body || !body.handle || !body.email) {
     return c.json({ error: "ハンドルネームとメールアドレスは必須です" }, 400);
+  }
+  if (!isValidEmail(body.email)) {
+    return c.json({ error: "メールアドレスの形式が正しくありません" }, 400);
   }
   if (!body.agreedToTerms) {
     return c.json({ error: "利用規約とプライバシーポリシーへの同意が必要です" }, 400);
@@ -1925,6 +1942,9 @@ app.post("/contact", async (c) => {
   const body = await c.req.json().catch(() => null);
   if (!body || !body.name || !body.email || !body.message) {
     return c.json({ error: "必須項目が不足しています" }, 400);
+  }
+  if (!isValidEmail(body.email)) {
+    return c.json({ error: "メールアドレスの形式が正しくありません" }, 400);
   }
   if (String(body.message).length > 5000) {
     return c.json({ error: "本文が長すぎます" }, 400);
