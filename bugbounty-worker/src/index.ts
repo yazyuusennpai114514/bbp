@@ -8,7 +8,6 @@ type Bindings = {
   PLATFORM_PAYPAL_LINK: string;
   RESEND_API_KEY: string;
   BREVO_API_KEY: string;
-  ANTHROPIC_API_KEY: string;
   DIDIT_API_KEY: string;
   DIDIT_WEBHOOK_SECRET: string;
   DIDIT_WORKFLOW_ID_HUNTER: string;
