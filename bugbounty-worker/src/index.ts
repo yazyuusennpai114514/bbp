@@ -1256,6 +1256,19 @@ app.post("/reports", async (c) => {
   const reportsOk = await checkRateLimit(c.env.DB, `reports:${user.userId}`, 20, 60 * 60 * 1000);
   if (!reportsOk) return c.json({ error: "レポートの提出回数が上限に達しました。しばらくしてから再度お試しください" }, 429);
 
+  // レベルによる月間（または3ヶ月）提出制限
+  const hunterLevel = await calcHunterLevel(c.env.DB, user.userId);
+  const limit = levelSubmitLimit(hunterLevel.score);
+  if (limit !== null) {
+    const windowLabel = limit.windowMs >= 80 * 24 * 60 * 60 * 1000 ? "3ヶ月" : "1ヶ月";
+    const levelOk = await checkRateLimit(c.env.DB, `reports-level:${user.userId}`, limit.max, limit.windowMs);
+    if (!levelOk) {
+      return c.json({
+        error: `現在のレベル（${hunterLevel.name}）では${windowLabel}に${limit.max}件までしかレポートを提出できません。有効なレポートを積み上げてレベルを上げてください。`,
+      }, 429);
+    }
+  }
+
   const body = await c.req.json().catch(() => null);
 
   if (!body || !body.programId || !body.title || !body.severity || !body.description || !body.contactEmail) {
@@ -1604,6 +1617,20 @@ const LEVEL_NAMES: Record<number, string> = {
    "4": "Expert",
    "5": "Elite",
 };
+
+// レベルスコアごとの提出上限
+// score >= 1 は制限なし（null）
+// score = 0〜-4 は月間上限
+// score = -5 は3ヶ月に1回
+function levelSubmitLimit(score: number): { max: number; windowMs: number } | null {
+  if (score >= 1) return null; // 制限なし
+  if (score === 0)  return { max: 6, windowMs: 30 * 24 * 60 * 60 * 1000 };
+  if (score === -1) return { max: 5, windowMs: 30 * 24 * 60 * 60 * 1000 };
+  if (score === -2) return { max: 4, windowMs: 30 * 24 * 60 * 60 * 1000 };
+  if (score === -3) return { max: 3, windowMs: 30 * 24 * 60 * 60 * 1000 };
+  if (score === -4) return { max: 2, windowMs: 30 * 24 * 60 * 60 * 1000 };
+  /* score === -5 */ return { max: 1, windowMs: 90 * 24 * 60 * 60 * 1000 };
+}
 
 // 有効レポート（トリアージ or 解決済み）2件ごとに+1、N/A 2件ごとに-1、-5〜+5でクランプ
 async function calcHunterLevel(db: D1Database, hunterId: string): Promise<{ score: number; name: string; validCount: number; naCount: number }> {
