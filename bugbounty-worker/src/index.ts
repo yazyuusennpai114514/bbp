@@ -661,11 +661,17 @@ app.get("/auth/me", async (c) => {
     canStartVerification = !!hasValidReport;
   }
 
+  let level = null;
+  if (user.userType === "hunter") {
+    level = await calcHunterLevel(c.env.DB, user.userId);
+  }
+
   return c.json({
     userType: user.userType,
     isOwner: user.actorType === "owner",
     actingMemberName,
     canStartVerification,
+    level,
     ...row,
   });
 });
@@ -1138,7 +1144,15 @@ app.get("/hunters", async (c) => {
       `SELECT id, handle, skills, portfolio, points, avatar_key, created_at
        FROM hunters WHERE totp_confirmed = 1 AND email_verified = 1 ORDER BY created_at DESC`
     ).all();
-    return c.json({ hunters: results });
+
+    const hunters = await Promise.all(
+      (results as any[]).map(async (h) => {
+        const level = await calcHunterLevel(c.env.DB, h.id);
+        return { ...h, level };
+      })
+    );
+
+    return c.json({ hunters });
   } catch (err) {
     console.error("D1 select error:", err);
     return c.json({ error: "取得に失敗しました" }, 500);
@@ -1571,6 +1585,44 @@ app.post("/reports/:id/comments", async (c) => {
 });
 
 const VALID_STATUSES = ["トリアージ", "返信待ち", "info", "解決済み", "スパム", "N/A", "重複", "閉鎖"];
+
+// =====================================================
+// ハンターレベル
+// =====================================================
+
+// -5〜+5 の11段階。0が初期値
+const LEVEL_NAMES: Record<number, string> = {
+  "-5": "Reckless",
+  "-4": "Shady",
+  "-3": "Suspect",
+  "-2": "Rookie",
+  "-1": "Novice",
+   "0": "Unranked",
+   "1": "Scout",
+   "2": "Hunter",
+   "3": "Veteran",
+   "4": "Expert",
+   "5": "Elite",
+};
+
+// 有効レポート（トリアージ or 解決済み）2件ごとに+1、N/A 2件ごとに-1、-5〜+5でクランプ
+async function calcHunterLevel(db: D1Database, hunterId: string): Promise<{ score: number; name: string; validCount: number; naCount: number }> {
+  const valid: any = await db
+    .prepare(`SELECT COUNT(*) AS c FROM reports WHERE hunter_id = ? AND status IN ('トリアージ', '解決済み')`)
+    .bind(hunterId)
+    .first();
+  const na: any = await db
+    .prepare(`SELECT COUNT(*) AS c FROM reports WHERE hunter_id = ? AND status = 'N/A'`)
+    .bind(hunterId)
+    .first();
+
+  const validCount = Number(valid?.c || 0);
+  const naCount = Number(na?.c || 0);
+  const raw = Math.floor(validCount / 2) - Math.floor(naCount / 2);
+  const score = Math.max(-5, Math.min(5, raw));
+
+  return { score, name: LEVEL_NAMES[String(score)], validCount, naCount };
+}
 
 // ステータスごとのポイント（該当しないステータスは0）
 function statusPoints(status: string, programType: string): number {
