@@ -1366,7 +1366,7 @@ app.get("/hunters/:id/reports", async (c) => {
   }
 });
 
-// 本人確認（Didit）を開始する。解決済みレポートが1件以上ないと申請できない
+// 本人確認（Didit）を開始する。トリアージ済みレポートが1件以上ないと申請できない
 app.post("/hunters/:id/start-verification", async (c) => {
   const id = c.req.param("id");
   const user = await getSessionUser(c);
