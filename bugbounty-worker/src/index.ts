@@ -1995,7 +1995,7 @@ app.post("/safe-harbor/submit", async (c) => {
     pdfUrl = await uploadToGoogleDrive(c.env, pdfBytes, filename);
   } catch (err) {
     console.error("Google Drive upload error:", err);
-    return c.json({ error: "PDF のアップロードに失敗しました" }, 500);
+    return c.json({ error: "PDF のアップロードに失敗しました", detail: String(err) }, 500);
   }
 
   // safe_harbor_pdf_url を保存 + badges に safe_harbor を追加
