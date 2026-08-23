@@ -11,6 +11,9 @@ type Bindings = {
   DIDIT_API_KEY: string;
   DIDIT_WEBHOOK_SECRET: string;
   DIDIT_WORKFLOW_ID_HUNTER: string;
+  // Safe Harbor / Google Drive
+  GDRIVE_SERVICE_ACCOUNT_JSON: string; // サービスアカウントのJSONキー（文字列化）
+  GDRIVE_FOLDER_ID: string;            // アップロード先フォルダID
 };
 
 type SessionUser = { userType: "hunter" | "program"; userId: string; actorType: "owner" | "member"; actorId: string | null };
@@ -24,6 +27,7 @@ const ALLOWED_ORIGINS = [
   "https://zizenntouroku.bughunter.uk", // 事前登録サイト
   "https://support.bughunter.uk", // サポートサイト
   "https://admin.bughunter.uk", // 管理画面（独自ドメインを設定していない場合は *.pages.dev のURLに変更）
+  "https://sign.bughunter.uk", // Safe Harbor 署名アプリ
 ];
 
 app.use(
@@ -642,7 +646,7 @@ app.get("/auth/me", async (c) => {
   const cols =
     user.userType === "hunter"
       ? "id, handle, email, skills, portfolio, paypal_link, points, verification_status, avatar_key, created_at"
-      : "id, company_name, contact_email, scope, description, reward_min, reward_max, program_type, verification_status, is_private, avatar_key, created_at";
+      : "id, company_name, contact_email, scope, description, reward_min, reward_max, program_type, verification_status, is_private, avatar_key, is_accepting, safe_harbor_pdf_url, badges, created_at";
 
   const row: any = await c.env.DB.prepare(`SELECT ${cols} FROM ${table} WHERE id = ?`).bind(user.userId).first();
   if (!row) return c.json({ error: "not found" }, 404);
@@ -823,7 +827,7 @@ app.post("/programs/:id/confirm-totp", async (c) => {
 app.get("/programs", async (c) => {
   try {
     const { results } = await c.env.DB.prepare(
-      `SELECT id, company_name, scope, description, reward_min, reward_max, program_type, verification_status, is_private, avatar_key, created_at
+      `SELECT id, company_name, scope, description, reward_min, reward_max, program_type, verification_status, is_private, avatar_key, badges, is_accepting, safe_harbor_pdf_url, created_at
        FROM programs WHERE totp_confirmed = 1 AND email_verified = 1 ORDER BY created_at DESC`
     ).all();
 
@@ -838,7 +842,8 @@ app.get("/programs", async (c) => {
       }
     }
 
-    const visible = hunterVerified ? rows : rows.filter((p) => !p.is_private);
+    const visibleRaw = hunterVerified ? rows : rows.filter((p) => !p.is_private);
+    const visible = await Promise.all(visibleRaw.map((p) => enrichProgram(c.env.DB, p)));
     return c.json({ programs: visible });
   } catch (err) {
     console.error("D1 select error:", err);
@@ -871,6 +876,7 @@ app.patch("/programs/:id", async (c) => {
   }
 
   const isPrivate: number | null = body.isPrivate !== undefined ? (body.isPrivate ? 1 : 0) : null;
+  const isAccepting: number | null = body.isAccepting !== undefined ? (body.isAccepting ? 1 : 0) : null;
 
   try {
     await c.env.DB.prepare(
@@ -880,10 +886,11 @@ app.patch("/programs/:id", async (c) => {
          description = COALESCE(?, description),
          reward_min = COALESCE(?, reward_min),
          reward_max = COALESCE(?, reward_max),
-         is_private = COALESCE(?, is_private)
+         is_private = COALESCE(?, is_private),
+         is_accepting = COALESCE(?, is_accepting)
        WHERE id = ?`
     )
-      .bind(companyName, scope, description, rewardMin, rewardMax, isPrivate, id)
+      .bind(companyName, scope, description, rewardMin, rewardMax, isPrivate, isAccepting, id)
       .run();
 
     return c.json({ updated: true });
@@ -1651,6 +1658,53 @@ async function calcHunterLevel(db: D1Database, hunterId: string): Promise<{ scor
   return { score, name: LEVEL_NAMES[String(score)], validCount, naCount };
 }
 
+
+// =====================================================
+// プログラムバッジ
+// =====================================================
+const PROGRAM_BADGES: Record<string, { label: string; imageUrl: string | null }> = {
+  responsive:   { label: "Responsive",   imageUrl: "https://1drv.ms/i/c/e4cd540adc823eeb/IQRFHSslWln0Tqv1wMu4aiRgAZI5z06m4HCYp2XLKkXAKgg?height=256" },
+  high_reward:  { label: "High Reward",  imageUrl: "https://1drv.ms/i/c/e4cd540adc823eeb/IQSPPKJTbwgqR7igUAWBCAelAVEf71YFT8vnFPz928_YEpM" },
+  active:       { label: "Active",       imageUrl: null },
+  safe_harbor:  { label: "Safe Harbor",  imageUrl: "https://1drv.ms/i/c/e4cd540adc823eeb/IQQID5GqHnFGQozW1CPSLMP0AbsqxPjoR63_LQGh_wSQziw" },
+};
+
+// =====================================================
+// バッジ自動計算（Active / High Reward）
+// =====================================================
+
+// Active: is_accepting=1 なら自動付与
+// High Reward: reward_max >= 1,000,000 なら自動付与
+// それ以外は手動バッジ（admin設定）をそのまま使う
+async function computeBadges(db: D1Database, programId: string): Promise<string[]> {
+  const p: any = await db
+    .prepare(`SELECT badges, is_accepting, reward_max FROM programs WHERE id = ?`)
+    .bind(programId)
+    .first();
+  if (!p) return [];
+
+  let badges: string[] = [];
+  try { badges = JSON.parse(p.badges || "[]"); } catch { badges = []; }
+
+  // Active
+  const hasActive = badges.includes("active");
+  if (p.is_accepting && !hasActive) badges.push("active");
+  if (!p.is_accepting && hasActive) badges = badges.filter((b: string) => b !== "active");
+
+  // High Reward
+  const hasHighReward = badges.includes("high_reward");
+  if (p.reward_max != null && Number(p.reward_max) >= 1_000_000 && !hasHighReward) badges.push("high_reward");
+  if ((p.reward_max == null || Number(p.reward_max) < 1_000_000) && hasHighReward) badges = badges.filter((b: string) => b !== "high_reward");
+
+  return badges;
+}
+
+// プログラム情報にバッジを自動補完して返す
+async function enrichProgram(db: D1Database, p: any): Promise<any> {
+  const badges = await computeBadges(db, p.id);
+  return { ...p, badges: JSON.stringify(badges) };
+}
+
 // ステータスごとのポイント（該当しないステータスは0）
 function statusPoints(status: string, programType: string): number {
   if (status === "解決済み") return programType === "vdp" ? 20 : 10;
@@ -1798,6 +1852,162 @@ app.delete("/admin/hunters/:id", async (c) => {
     console.error("D1 admin delete error:", err);
     return c.json({ error: "削除に失敗しました" }, 500);
   }
+});
+
+app.patch("/admin/programs/:id/badges", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => null);
+  if (!body || !Array.isArray(body.badges)) {
+    return c.json({ error: "badges は配列で指定してください" }, 400);
+  }
+  const validKeys = Object.keys(PROGRAM_BADGES);
+  const filtered = (body.badges as string[]).filter((b) => validKeys.includes(b));
+  await c.env.DB.prepare(`UPDATE programs SET badges = ? WHERE id = ?`)
+    .bind(JSON.stringify(filtered), id)
+    .run();
+  return c.json({ badges: filtered });
+});
+
+// =====================================================
+// Safe Harbor 署名フロー
+// =====================================================
+
+// Google Drive にPDFをアップロードしてURLを返すヘルパー
+async function uploadToGoogleDrive(env: any, pdfBytes: ArrayBuffer, filename: string): Promise<string> {
+  // サービスアカウントJSON からアクセストークンを取得
+  const sa = JSON.parse(env.GDRIVE_SERVICE_ACCOUNT_JSON);
+  const now = Math.floor(Date.now() / 1000);
+  const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" })).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+  const payload = btoa(JSON.stringify({
+    iss: sa.client_email,
+    scope: "https://www.googleapis.com/auth/drive.file",
+    aud: "https://oauth2.googleapis.com/token",
+    exp: now + 3600,
+    iat: now,
+  })).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+
+  // RS256 署名 (Web Crypto)
+  const pemBody = sa.private_key.replace(/-----.*-----/g, "").replace(/\s/g, "");
+  const keyData = Uint8Array.from(atob(pemBody), (c) => c.charCodeAt(0));
+  const cryptoKey = await crypto.subtle.importKey(
+    "pkcs8", keyData.buffer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false, ["sign"]
+  );
+  const sigInput = new TextEncoder().encode(`${header}.${payload}`);
+  const sigBytes = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, sigInput);
+  const sig = btoa(String.fromCharCode(...new Uint8Array(sigBytes))).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${header}.${payload}.${sig}`,
+  });
+  const { access_token } = await tokenRes.json() as any;
+
+  // multipart/form-data でPDFをアップロード
+  const meta = JSON.stringify({ name: filename, parents: [env.GDRIVE_FOLDER_ID] });
+  const boundary = "bughunter_boundary";
+  const metaPart = `--${boundary}
+Content-Type: application/json; charset=UTF-8
+
+${meta}
+`;
+  const filePart = `--${boundary}
+Content-Type: application/pdf
+
+`;
+  const closing = `
+--${boundary}--`;
+  const enc = new TextEncoder();
+  const body = new Uint8Array([
+    ...enc.encode(metaPart),
+    ...enc.encode(filePart),
+    ...new Uint8Array(pdfBytes),
+    ...enc.encode(closing),
+  ]);
+  const uploadRes = await fetch(
+    "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${access_token}`,
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+      },
+      body,
+    }
+  );
+  const uploaded = await uploadRes.json() as any;
+
+  // 全員が閲覧できるよう権限付与
+  await fetch(`https://www.googleapis.com/drive/v3/files/${uploaded.id}/permissions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${access_token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ role: "reader", type: "anyone" }),
+  });
+
+  return uploaded.webViewLink as string;
+}
+
+// sign.bughunter.uk から呼ばれる: 企業アカウントでログイン確認して会社名を返す
+app.get("/safe-harbor/me", async (c) => {
+  const user = await getSessionUser(c);
+  if (!user || user.userType !== "program") {
+    return c.json({ error: "企業アカウントでログインしてください" }, 401);
+  }
+  const program: any = await c.env.DB.prepare(
+    `SELECT company_name, safe_harbor_pdf_url FROM programs WHERE id = ?`
+  ).bind(user.userId).first();
+  if (!program) return c.json({ error: "not found" }, 404);
+  return c.json({ companyName: program.company_name, pdfUrl: program.safe_harbor_pdf_url });
+});
+
+// sign.bughunter.uk から呼ばれる: PDFをアップロードして programs に保存、Safe Harborバッジを付与
+app.post("/safe-harbor/submit", async (c) => {
+  const user = await getSessionUser(c);
+  if (!user || user.userType !== "program") {
+    return c.json({ error: "企業アカウントでログインしてください" }, 401);
+  }
+
+  // PDF は base64 で受け取る
+  const body = await c.req.json().catch(() => null);
+  if (!body?.pdf) return c.json({ error: "PDF が含まれていません" }, 400);
+
+  let pdfBytes: ArrayBuffer;
+  try {
+    const bin = atob(body.pdf);
+    pdfBytes = Uint8Array.from(bin, (ch) => ch.charCodeAt(0)).buffer;
+  } catch {
+    return c.json({ error: "PDF のデコードに失敗しました" }, 400);
+  }
+
+  const program: any = await c.env.DB.prepare(
+    `SELECT company_name, badges FROM programs WHERE id = ?`
+  ).bind(user.userId).first();
+
+  const filename = `safe-harbor_${program.company_name}_${Date.now()}.pdf`;
+  let pdfUrl: string;
+  try {
+    pdfUrl = await uploadToGoogleDrive(c.env, pdfBytes, filename);
+  } catch (err) {
+    console.error("Google Drive upload error:", err);
+    return c.json({ error: "PDF のアップロードに失敗しました" }, 500);
+  }
+
+  // safe_harbor_pdf_url を保存 + badges に safe_harbor を追加
+  let badges: string[] = [];
+  try { badges = JSON.parse(program.badges || "[]"); } catch {}
+  if (!badges.includes("safe_harbor")) badges.push("safe_harbor");
+
+  await c.env.DB.prepare(
+    `UPDATE programs SET safe_harbor_pdf_url = ?, badges = ? WHERE id = ?`
+  ).bind(pdfUrl, JSON.stringify(badges), user.userId).run();
+
+  return c.json({ pdfUrl });
 });
 
 app.delete("/admin/programs/:id", async (c) => {
