@@ -12,7 +12,7 @@ type Bindings = {
   DIDIT_WEBHOOK_SECRET: string;
   DIDIT_WORKFLOW_ID_HUNTER: string;
   // Safe Harbor / Google Drive
-  GDRIVE_SERVICE_ACCOUNT_JSON: string; // サービスアカウントのJSONキー（文字列化）
+  GDRIVE_SERVICE_ACCOUNT_JSON: string; 
   GDRIVE_FOLDER_ID: string;            // アップロード先フォルダID
 };
 
