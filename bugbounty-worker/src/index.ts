@@ -11,9 +11,8 @@ type Bindings = {
   DIDIT_API_KEY: string;
   DIDIT_WEBHOOK_SECRET: string;
   DIDIT_WORKFLOW_ID_HUNTER: string;
-  // Safe Harbor / Google Drive
-  GDRIVE_SERVICE_ACCOUNT_JSON: string; // サービスアカウントのJSONキー（文字列化）
-  GDRIVE_FOLDER_ID: string;            // アップロード先フォルダID
+  // Safe Harbor
+  SAFE_HARBOR: R2Bucket; // 署名画像保存用R2バケット
 };
 
 type SessionUser = { userType: "hunter" | "program"; userId: string; actorType: "owner" | "member"; actorId: string | null };
@@ -1873,90 +1872,13 @@ app.patch("/admin/programs/:id/badges", async (c) => {
 // Safe Harbor 署名フロー
 // =====================================================
 
-// Google Drive にPDFをアップロードしてURLを返すヘルパー
-async function uploadToGoogleDrive(env: any, imgBytes: ArrayBuffer, filename: string): Promise<string> {
-  // サービスアカウントJSON からアクセストークンを取得
-  // CloudflareダッシュボードでのコピペでBOMや余分な文字が入ることがあるためサニタイズ
-  const rawJson = env.GDRIVE_SERVICE_ACCOUNT_JSON
-    .replace(/^﻿/, "")        // BOM除去
-    .replace(/^[^{]*({)/, "$1")   // { より前のゴミを除去
-    .replace(/}[^}]*$/, "}")       // } より後のゴミを除去
-    .trim();
-  const sa = JSON.parse(rawJson);
-  const now = Math.floor(Date.now() / 1000);
-  const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" })).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-  const payload = btoa(JSON.stringify({
-    iss: sa.client_email,
-    scope: "https://www.googleapis.com/auth/drive.file",
-    aud: "https://oauth2.googleapis.com/token",
-    exp: now + 3600,
-    iat: now,
-  })).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-
-  // RS256 署名 (Web Crypto)
-  const pemBody = sa.private_key.replace(/-----.*-----/g, "").replace(/\s/g, "");
-  const keyData = Uint8Array.from(atob(pemBody), (c) => c.charCodeAt(0));
-  const cryptoKey = await crypto.subtle.importKey(
-    "pkcs8", keyData.buffer,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false, ["sign"]
-  );
-  const sigInput = new TextEncoder().encode(`${header}.${payload}`);
-  const sigBytes = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, sigInput);
-  const sig = btoa(String.fromCharCode(...new Uint8Array(sigBytes))).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-
-  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${header}.${payload}.${sig}`,
+// R2 に署名画像をアップロードして公開URLを返すヘルパー
+async function uploadToR2(env: any, imgBytes: ArrayBuffer, filename: string): Promise<string> {
+  await env.SAFE_HARBOR.put(filename, imgBytes, {
+    httpMetadata: { contentType: "image/jpeg" },
   });
-  const { access_token } = await tokenRes.json() as any;
-
-  // multipart/form-data でPDFをアップロード
-  const meta = JSON.stringify({ name: filename, parents: [env.GDRIVE_FOLDER_ID] });
-  const boundary = "bughunter_boundary";
-  const metaPart = `--${boundary}
-Content-Type: application/json; charset=UTF-8
-
-${meta}
-`;
-  const filePart = `--${boundary}
-Content-Type: image/jpeg
-
-`;
-  const closing = `
---${boundary}--`;
-  const enc = new TextEncoder();
-  const body = new Uint8Array([
-    ...enc.encode(metaPart),
-    ...enc.encode(filePart),
-    ...new Uint8Array(imgBytes),
-    ...enc.encode(closing),
-  ]);
-  const uploadRes = await fetch(
-    "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${access_token}`,
-        "Content-Type": `multipart/form-data; boundary=${boundary}`,
-      },
-      body,
-    }
-  );
-  const uploaded = await uploadRes.json() as any;
-
-  // 全員が閲覧できるよう権限付与
-  await fetch(`https://www.googleapis.com/drive/v3/files/${uploaded.id}/permissions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${access_token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ role: "reader", type: "anyone" }),
-  });
-
-  return uploaded.webViewLink as string;
+  // 公開URLは Workers経由で返す（R2のパブリックURLまたはWorker経由）
+  return `https://api.bughunter.uk/safe-harbor/files/${encodeURIComponent(filename)}`;
 }
 
 // sign.bughunter.uk から呼ばれる: 企業アカウントでログイン確認して会社名を返す
@@ -1995,13 +1917,12 @@ app.post("/safe-harbor/submit", async (c) => {
     `SELECT company_name, badges FROM programs WHERE id = ?`
   ).bind(user.userId).first();
 
-  const filename = `safe-harbor_${program.company_name}_${Date.now()}.jpg`;
+  const filename = `safe-harbor_${program.company_name}_${Date.now()}.png`;
   let pdfUrl: string;
   try {
-    pdfUrl = await uploadToGoogleDrive(c.env, imgBytes, filename);
-    // pdfUrl → imgUrl として使うが変数名はそのまま
+    pdfUrl = await uploadToR2(c.env, imgBytes, filename);
   } catch (err) {
-    console.error("Google Drive upload error:", err);
+    console.error("R2 upload error:", err);
     return c.json({ error: "画像のアップロードに失敗しました", detail: String(err) }, 500);
   }
 
@@ -2015,6 +1936,17 @@ app.post("/safe-harbor/submit", async (c) => {
   ).bind(pdfUrl, JSON.stringify(badges), user.userId).run();
 
   return c.json({ pdfUrl });
+});
+
+// R2から署名画像を返すエンドポイント（認証不要・公開）
+app.get("/safe-harbor/files/:filename", async (c) => {
+  const filename = c.req.param("filename");
+  const obj = await c.env.SAFE_HARBOR.get(filename);
+  if (!obj) return c.json({ error: "not found" }, 404);
+  const headers = new Headers();
+  headers.set("Content-Type", "image/jpeg");
+  headers.set("Cache-Control", "public, max-age=31536000");
+  return new Response(obj.body, { headers });
 });
 
 app.delete("/admin/programs/:id", async (c) => {
