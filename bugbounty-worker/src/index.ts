@@ -1876,7 +1876,13 @@ app.patch("/admin/programs/:id/badges", async (c) => {
 // Google Drive にPDFをアップロードしてURLを返すヘルパー
 async function uploadToGoogleDrive(env: any, imgBytes: ArrayBuffer, filename: string): Promise<string> {
   // サービスアカウントJSON からアクセストークンを取得
-  const sa = JSON.parse(env.GDRIVE_SERVICE_ACCOUNT_JSON);
+  // CloudflareダッシュボードでのコピペでBOMや余分な文字が入ることがあるためサニタイズ
+  const rawJson = env.GDRIVE_SERVICE_ACCOUNT_JSON
+    .replace(/^﻿/, "")        // BOM除去
+    .replace(/^[^{]*({)/, "$1")   // { より前のゴミを除去
+    .replace(/}[^}]*$/, "}")       // } より後のゴミを除去
+    .trim();
+  const sa = JSON.parse(rawJson);
   const now = Math.floor(Date.now() / 1000);
   const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" })).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
   const payload = btoa(JSON.stringify({
