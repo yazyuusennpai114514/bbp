@@ -12,7 +12,7 @@ type Bindings = {
   DIDIT_WEBHOOK_SECRET: string;
   DIDIT_WORKFLOW_ID_HUNTER: string;
   // Safe Harbor / Google Drive
-  GDRIVE_SERVICE_ACCOUNT_JSON: string; 
+  GDRIVE_SERVICE_ACCOUNT_JSON: string; // サービスアカウントのJSONキー（文字列化）
   GDRIVE_FOLDER_ID: string;            // アップロード先フォルダID
 };
 
@@ -1874,7 +1874,7 @@ app.patch("/admin/programs/:id/badges", async (c) => {
 // =====================================================
 
 // Google Drive にPDFをアップロードしてURLを返すヘルパー
-async function uploadToGoogleDrive(env: any, pdfBytes: ArrayBuffer, filename: string): Promise<string> {
+async function uploadToGoogleDrive(env: any, imgBytes: ArrayBuffer, filename: string): Promise<string> {
   // サービスアカウントJSON からアクセストークンを取得
   const sa = JSON.parse(env.GDRIVE_SERVICE_ACCOUNT_JSON);
   const now = Math.floor(Date.now() / 1000);
@@ -1915,7 +1915,7 @@ Content-Type: application/json; charset=UTF-8
 ${meta}
 `;
   const filePart = `--${boundary}
-Content-Type: application/pdf
+Content-Type: image/png
 
 `;
   const closing = `
@@ -1924,7 +1924,7 @@ Content-Type: application/pdf
   const body = new Uint8Array([
     ...enc.encode(metaPart),
     ...enc.encode(filePart),
-    ...new Uint8Array(pdfBytes),
+    ...new Uint8Array(imgBytes),
     ...enc.encode(closing),
   ]);
   const uploadRes = await fetch(
@@ -1975,27 +1975,28 @@ app.post("/safe-harbor/submit", async (c) => {
 
   // PDF は base64 で受け取る
   const body = await c.req.json().catch(() => null);
-  if (!body?.pdf) return c.json({ error: "PDF が含まれていません" }, 400);
+  if (!body?.png) return c.json({ error: "画像が含まれていません" }, 400);
 
-  let pdfBytes: ArrayBuffer;
+  let imgBytes: ArrayBuffer;
   try {
-    const bin = atob(body.pdf);
-    pdfBytes = Uint8Array.from(bin, (ch) => ch.charCodeAt(0)).buffer;
+    const bin = atob(body.png);
+    imgBytes = Uint8Array.from(bin, (ch) => ch.charCodeAt(0)).buffer;
   } catch {
-    return c.json({ error: "PDF のデコードに失敗しました" }, 400);
+    return c.json({ error: "画像のデコードに失敗しました" }, 400);
   }
 
   const program: any = await c.env.DB.prepare(
     `SELECT company_name, badges FROM programs WHERE id = ?`
   ).bind(user.userId).first();
 
-  const filename = `safe-harbor_${program.company_name}_${Date.now()}.pdf`;
+  const filename = `safe-harbor_${program.company_name}_${Date.now()}.png`;
   let pdfUrl: string;
   try {
-    pdfUrl = await uploadToGoogleDrive(c.env, pdfBytes, filename);
+    pdfUrl = await uploadToGoogleDrive(c.env, imgBytes, filename);
+    // pdfUrl → imgUrl として使うが変数名はそのまま
   } catch (err) {
     console.error("Google Drive upload error:", err);
-    return c.json({ error: "PDF のアップロードに失敗しました", detail: String(err) }, 500);
+    return c.json({ error: "画像のアップロードに失敗しました", detail: String(err) }, 500);
   }
 
   // safe_harbor_pdf_url を保存 + badges に safe_harbor を追加
