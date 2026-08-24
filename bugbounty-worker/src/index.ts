@@ -1921,7 +1921,7 @@ Content-Type: application/json; charset=UTF-8
 ${meta}
 `;
   const filePart = `--${boundary}
-Content-Type: image/png
+Content-Type: image/jpeg
 
 `;
   const closing = `
@@ -1995,7 +1995,7 @@ app.post("/safe-harbor/submit", async (c) => {
     `SELECT company_name, badges FROM programs WHERE id = ?`
   ).bind(user.userId).first();
 
-  const filename = `safe-harbor_${program.company_name}_${Date.now()}.png`;
+  const filename = `safe-harbor_${program.company_name}_${Date.now()}.jpg`;
   let pdfUrl: string;
   try {
     pdfUrl = await uploadToGoogleDrive(c.env, imgBytes, filename);
