@@ -644,7 +644,7 @@ app.get("/auth/me", async (c) => {
   const table = user.userType === "hunter" ? "hunters" : "programs";
   const cols =
     user.userType === "hunter"
-      ? "id, handle, email, skills, portfolio, paypal_link, points, verification_status, avatar_key, created_at"
+      ? "id, handle, email, skills, portfolio, paypal_link, points, verification_status, avatar_key, profile_public, show_level, show_points, show_resolved, show_bounty_total, show_companies, created_at"
       : "id, company_name, contact_email, scope, description, reward_min, reward_max, program_type, verification_status, is_private, avatar_key, is_accepting, safe_harbor_pdf_url, badges, created_at";
 
   const row: any = await c.env.DB.prepare(`SELECT ${cols} FROM ${table} WHERE id = ?`).bind(user.userId).first();
@@ -1180,6 +1180,12 @@ app.patch("/hunters/:id", async (c) => {
   const skills = body.skills ?? null;
   const portfolio = body.portfolio ?? null;
   const paypalLink = body.paypalLink ?? null;
+  const profilePublic = body.profilePublic !== undefined ? (body.profilePublic ? 1 : 0) : null;
+  const showLevel = body.showLevel !== undefined ? (body.showLevel ? 1 : 0) : null;
+  const showPoints = body.showPoints !== undefined ? (body.showPoints ? 1 : 0) : null;
+  const showResolved = body.showResolved !== undefined ? (body.showResolved ? 1 : 0) : null;
+  const showBountyTotal = body.showBountyTotal !== undefined ? (body.showBountyTotal ? 1 : 0) : null;
+  const showCompanies = body.showCompanies !== undefined ? (body.showCompanies ? 1 : 0) : null;
 
   if (handle === "") {
     return c.json({ error: "ハンドルネームは空にできません" }, 400);
@@ -1191,10 +1197,16 @@ app.patch("/hunters/:id", async (c) => {
          handle = COALESCE(?, handle),
          skills = COALESCE(?, skills),
          portfolio = COALESCE(?, portfolio),
-         paypal_link = COALESCE(?, paypal_link)
+         paypal_link = COALESCE(?, paypal_link),
+         profile_public = COALESCE(?, profile_public),
+         show_level = COALESCE(?, show_level),
+         show_points = COALESCE(?, show_points),
+         show_resolved = COALESCE(?, show_resolved),
+         show_bounty_total = COALESCE(?, show_bounty_total),
+         show_companies = COALESCE(?, show_companies)
        WHERE id = ?`
     )
-      .bind(handle, skills, portfolio, paypalLink, id)
+      .bind(handle, skills, portfolio, paypalLink, profilePublic, showLevel, showPoints, showResolved, showBountyTotal, showCompanies, id)
       .run();
 
     return c.json({ updated: true });
@@ -1866,6 +1878,60 @@ app.patch("/admin/programs/:id/badges", async (c) => {
     .bind(JSON.stringify(filtered), id)
     .run();
   return c.json({ badges: filtered });
+});
+
+// =====================================================
+// 公開プロフィール（/u/:handle）
+// =====================================================
+
+app.get("/u/:handle", async (c) => {
+  const handle = c.req.param("handle");
+  const hunter: any = await c.env.DB.prepare(
+    `SELECT id, handle, points, skills, portfolio, avatar_key, created_at,
+            profile_public, show_level, show_points, show_resolved, show_bounty_total, show_companies
+     FROM hunters WHERE handle = ? AND totp_confirmed = 1 AND email_verified = 1`
+  ).bind(handle).first();
+
+  if (!hunter) return c.json({ error: "ユーザーが見つかりません" }, 404);
+  if (!hunter.profile_public) return c.json({ error: "このプロフィールは非公開です" }, 403);
+
+  // レベル計算
+  const level = await calcHunterLevel(c.env.DB, hunter.id);
+
+  // 解決済みレポート数
+  const resolved: any = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS c FROM reports WHERE hunter_id = ? AND status = '解決済み'`
+  ).bind(hunter.id).first();
+
+  // 総報奨金額
+  const bounty: any = await c.env.DB.prepare(
+    `SELECT COALESCE(SUM(bounty_amount), 0) AS total FROM reports WHERE hunter_id = ? AND bounty_paid = 1`
+  ).bind(hunter.id).first();
+
+  // 報奨金を受け取った企業一覧
+  let companies: any[] = [];
+  if (hunter.show_companies) {
+    const rows = await c.env.DB.prepare(
+      `SELECT DISTINCT p.company_name, p.avatar_key
+       FROM reports r
+       JOIN programs p ON r.program_id = p.id
+       WHERE r.hunter_id = ? AND r.bounty_paid = 1`
+    ).bind(hunter.id).all();
+    companies = rows.results as any[];
+  }
+
+  return c.json({
+    handle: hunter.handle,
+    avatarKey: hunter.avatar_key,
+    skills: hunter.skills,
+    portfolio: hunter.portfolio,
+    createdAt: hunter.created_at,
+    level: hunter.show_level ? level : null,
+    points: hunter.show_points ? hunter.points : null,
+    resolvedCount: hunter.show_resolved ? Number(resolved?.c || 0) : null,
+    bountyTotal: hunter.show_bounty_total ? Number(bounty?.total || 0) : null,
+    companies: hunter.show_companies ? companies : null,
+  });
 });
 
 // =====================================================
