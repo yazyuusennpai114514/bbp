@@ -1898,7 +1898,7 @@ app.get("/u/:handle", async (c) => {
 
   // 総報奨金額
   const bounty: any = await c.env.DB.prepare(
-    `SELECT COALESCE(SUM(bounty_amount), 0) AS total FROM reports WHERE hunter_id = ? AND bounty_paid = 1`
+    `SELECT COALESCE(SUM(reward_amount), 0) AS total FROM reports WHERE hunter_id = ? AND reward_paid = 1`
   ).bind(hunter.id).first();
 
   // 報奨金を受け取った企業一覧
@@ -1908,7 +1908,7 @@ app.get("/u/:handle", async (c) => {
       `SELECT DISTINCT p.company_name, p.avatar_key
        FROM reports r
        JOIN programs p ON r.program_id = p.id
-       WHERE r.hunter_id = ? AND r.bounty_paid = 1`
+       WHERE r.hunter_id = ? AND r.reward_paid = 1`
     ).bind(hunter.id).all();
     companies = rows.results as any[];
   }
