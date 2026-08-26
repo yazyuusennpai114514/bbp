@@ -19,15 +19,8 @@ type SessionUser = { userType: "hunter" | "program"; userId: string; actorType: 
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-// 自分のサイトからのアクセスだけ許可する。新しいサイトを追加した時はここにも追記すること
-const ALLOWED_ORIGINS = [
-  "https://bughunter.uk",
-  "https://www.bughunter.uk",
-  "https://zizenntouroku.bughunter.uk", // 事前登録サイト
-  "https://support.bughunter.uk", // サポートサイト
-  "https://admin.bughunter.uk", // 管理画面（独自ドメインを設定していない場合は *.pages.dev のURLに変更）
-  "https://sign.bughunter.uk", // Safe Harbor 署名アプリ
-];
+// bughunter.uk の全サブドメインからのアクセスを許可
+const ALLOWED_ORIGINS_PATTERN = /^https:\/\/([a-z0-9-]+\.)?bughunter\.uk$/;
 
 app.use(
   "*",
