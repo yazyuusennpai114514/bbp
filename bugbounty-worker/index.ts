@@ -25,7 +25,7 @@ const ALLOWED_ORIGINS_PATTERN = /^https:\/\/([a-z0-9-]+\.)?bughunter\.uk$/;
 app.use(
   "*",
   cors({
-    origin: "*",
+    origin: (origin) => (origin && ALLOWED_ORIGINS_PATTERN.test(origin) ? origin : null),
     allowHeaders: ["Content-Type", "Authorization", "X-Admin-Key"],
   })
 );
@@ -340,78 +340,6 @@ function mapDiditStatus(status: string): "verified" | "rejected" | "pending" | "
   if (s === "in review" || s === "in_review" || s === "not started" || s === "not_started" || s === "in progress" || s === "in_progress") return "pending";
   return "none"; // abandoned など
 }
-
-// =====================================================
-// Didit Webhook（ステータス更新の受信）
-// =====================================================
-
-app.post("/webhooks/didit", async (c) => {
-  const rawBody = await c.req.text();
-  const signature = c.req.header("X-Signature") || c.req.header("x-signature");
-
-  const valid = await verifyDiditSignature(c.env.DIDIT_WEBHOOK_SECRET, rawBody, signature);
-  if (!valid) {
-    console.error("Didit webhook signature verification failed");
-    return c.json({ error: "invalid signature" }, 401);
-  }
-
-  let payload: any;
-  try {
-    payload = JSON.parse(rawBody);
-  } catch (err) {
-    return c.json({ error: "invalid payload" }, 400);
-  }
-
-  const sessionId: string | undefined = payload.session_id;
-  const status: string | undefined = payload.status;
-  if (!sessionId || !status) {
-    return c.json({ error: "missing session_id or status" }, 400);
-  }
-
-  const mapped = mapDiditStatus(status);
-
-  const session: any = await c.env.DB.prepare(`SELECT * FROM didit_sessions WHERE session_id = ?`).bind(sessionId).first();
-  if (!session) {
-    console.error("Didit webhook: unknown session_id", sessionId);
-    return c.json({ received: true }); // 200で応答しないとDidit側がリトライし続けるため
-  }
-
-  const table = session.entity_type === "hunter" ? "hunters" : "programs";
-  await c.env.DB.prepare(`UPDATE ${table} SET verification_status = ? WHERE id = ?`).bind(mapped, session.entity_id).run();
-
-  // 結果をメールで通知
-  try {
-    if (session.entity_type === "hunter") {
-      const hunter: any = await c.env.DB.prepare(`SELECT email, handle FROM hunters WHERE id = ?`).bind(session.entity_id).first();
-      if (hunter && (mapped === "verified" || mapped === "rejected")) {
-        await sendEmail(
-          c.env,
-          hunter.email,
-          `【bughunter.uk】本人確認の結果: ${mapped === "verified" ? "承認されました" : "却下されました"}`,
-          mapped === "verified"
-            ? "本人確認が承認されました。非公開プログラムの閲覧・応募が可能になりました。"
-            : "本人確認が却下されました。お手数ですが、マイページから再度お申し込みください。"
-        );
-      }
-    } else {
-      const program: any = await c.env.DB.prepare(`SELECT contact_email, company_name FROM programs WHERE id = ?`).bind(session.entity_id).first();
-      if (program && (mapped === "verified" || mapped === "rejected")) {
-        await sendEmail(
-          c.env,
-          program.contact_email,
-          `【bughunter.uk】企業確認の結果: ${mapped === "verified" ? "承認されました" : "却下されました"}`,
-          mapped === "verified"
-            ? "企業確認が承認されました。非公開プログラムを作成できるようになりました。"
-            : "企業確認が却下されました。お手数ですが、マイページから再度お申し込みください。"
-        );
-      }
-    }
-  } catch (err) {
-    console.error("Didit webhook notification email error:", err);
-  }
-
-  return c.json({ received: true });
-});
 
 const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -1826,6 +1754,70 @@ function requireAdmin(c: any): boolean {
   const key = c.req.header("X-Admin-Key");
   return !!key && !!c.env.ADMIN_KEY && key === c.env.ADMIN_KEY;
 }
+
+// 管理画面から @bughunter.uk の任意アドレスを送信元にしてメールを送る
+// ※ 送信元ドメインは Brevo / Resend 側で bughunter.uk の認証（SPF/DKIM）済みであること
+const MAIL_FROM_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}@bughunter\.uk$/;
+
+app.post("/admin/email/send", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+
+  let body: any;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid json" }, 400);
+  }
+
+  const from = String(body.from ?? "").trim().toLowerCase();
+  const fromName = String(body.fromName ?? "bughunter.uk").trim().slice(0, 80).replace(/[\r\n<>]/g, "");
+  const subject = String(body.subject ?? "").trim().replace(/[\r\n]/g, " ");
+  const text = String(body.text ?? "");
+  const rawTo = Array.isArray(body.to) ? body.to : String(body.to ?? "").split(/[,\s;]+/);
+  const to = [...new Set(rawTo.map((x: any) => String(x).trim()).filter(Boolean))] as string[];
+
+  if (!MAIL_FROM_PATTERN.test(from)) return c.json({ error: "送信元は @bughunter.uk のアドレスのみ指定できます" }, 400);
+  if (to.length === 0) return c.json({ error: "宛先を指定してください" }, 400);
+  if (to.length > 20) return c.json({ error: "宛先は20件までです" }, 400);
+  if (!to.every(isValidEmail)) return c.json({ error: "宛先のメールアドレスが不正です" }, 400);
+  if (!subject || subject.length > 200) return c.json({ error: "件名は1〜200文字で入力してください" }, 400);
+  if (!text.trim() || text.length > 20000) return c.json({ error: "本文は1〜20000文字で入力してください" }, 400);
+
+  const results: { to: string; ok: boolean }[] = [];
+  for (const addr of to) {
+    let ok = false;
+    if (c.env.BREVO_API_KEY) {
+      try {
+        const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+          method: "POST",
+          headers: { "api-key": c.env.BREVO_API_KEY, "Content-Type": "application/json" },
+          body: JSON.stringify({ sender: { name: fromName, email: from }, to: [{ email: addr }], subject, textContent: text }),
+        });
+        ok = res.ok;
+        if (!ok) console.error("Admin mail via Brevo failed:", res.status, await res.text().catch(() => ""));
+      } catch (err) {
+        console.error("Admin mail via Brevo error:", err);
+      }
+    }
+    if (!ok && c.env.RESEND_API_KEY) {
+      try {
+        const res = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${c.env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ from: `${fromName} <${from}>`, to: [addr], subject, text }),
+        });
+        ok = res.ok;
+        if (!ok) console.error("Admin mail via Resend failed:", res.status, await res.text().catch(() => ""));
+      } catch (err) {
+        console.error("Admin mail via Resend error:", err);
+      }
+    }
+    results.push({ to: addr, ok });
+  }
+
+  const failed = results.filter((r) => !r.ok).length;
+  return c.json({ sent: results.length - failed, failed, results }, failed === results.length ? 502 : 200);
+});
 
 app.get("/admin/hunters", async (c) => {
   if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
