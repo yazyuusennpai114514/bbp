@@ -1783,9 +1783,11 @@ app.post("/admin/email/send", async (c) => {
   if (!subject || subject.length > 200) return c.json({ error: "件名は1〜200文字で入力してください" }, 400);
   if (!text.trim() || text.length > 20000) return c.json({ error: "本文は1〜20000文字で入力してください" }, 400);
 
-  const results: { to: string; ok: boolean }[] = [];
+  const results: { to: string; ok: boolean; error?: string }[] = [];
   for (const addr of to) {
     let ok = false;
+    const errs: string[] = [];
+    if (!c.env.BREVO_API_KEY && !c.env.RESEND_API_KEY) errs.push("APIキー未設定（BREVO_API_KEY / RESEND_API_KEY）");
     if (c.env.BREVO_API_KEY) {
       try {
         const res = await fetch("https://api.brevo.com/v3/smtp/email", {
@@ -1794,9 +1796,14 @@ app.post("/admin/email/send", async (c) => {
           body: JSON.stringify({ sender: { name: fromName, email: from }, to: [{ email: addr }], subject, textContent: text }),
         });
         ok = res.ok;
-        if (!ok) console.error("Admin mail via Brevo failed:", res.status, await res.text().catch(() => ""));
+        if (!ok) {
+          const t = await res.text().catch(() => "");
+          console.error("Admin mail via Brevo failed:", res.status, t);
+          errs.push(`Brevo ${res.status}: ${t.slice(0, 200)}`);
+        }
       } catch (err) {
         console.error("Admin mail via Brevo error:", err);
+        errs.push("Brevo 通信エラー");
       }
     }
     if (!ok && c.env.RESEND_API_KEY) {
@@ -1807,12 +1814,17 @@ app.post("/admin/email/send", async (c) => {
           body: JSON.stringify({ from: `${fromName} <${from}>`, to: [addr], subject, text }),
         });
         ok = res.ok;
-        if (!ok) console.error("Admin mail via Resend failed:", res.status, await res.text().catch(() => ""));
+        if (!ok) {
+          const t = await res.text().catch(() => "");
+          console.error("Admin mail via Resend failed:", res.status, t);
+          errs.push(`Resend ${res.status}: ${t.slice(0, 200)}`);
+        }
       } catch (err) {
         console.error("Admin mail via Resend error:", err);
+        errs.push("Resend 通信エラー");
       }
     }
-    results.push({ to: addr, ok });
+    results.push({ to: addr, ok, ...(ok ? {} : { error: errs.join(" / ") }) });
   }
 
   const failed = results.filter((r) => !r.ok).length;
