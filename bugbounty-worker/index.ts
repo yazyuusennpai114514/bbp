@@ -64,6 +64,19 @@ async function checkRateLimit(db: D1Database, key: string, maxAttempts: number, 
   }
 }
 
+// 制限超過中かどうかを数えずに確認する（true = ブロック中）
+async function isRateLimited(db: D1Database, key: string, maxAttempts: number, windowMs: number): Promise<boolean> {
+  try {
+    const row: any = await db.prepare(`SELECT count, window_start FROM rate_limits WHERE key = ?`).bind(key).first();
+    if (!row) return false;
+    if (Date.now() - row.window_start > windowMs) return false;
+    return row.count >= maxAttempts;
+  } catch (err) {
+    console.error("rate limit peek error:", err);
+    return false;
+  }
+}
+
 function clientIp(c: any): string {
   return c.req.header("cf-connecting-ip") || c.req.header("x-forwarded-for") || "unknown";
 }
@@ -682,6 +695,9 @@ app.post("/programs", async (c) => {
 // メール認証コードの確認
 app.post("/programs/:id/confirm-email", async (c) => {
   const id = c.req.param("id");
+  if (!(await checkRateLimit(c.env.DB, `email-confirm:programs:${id}`, 10, 15 * 60 * 1000))) {
+    return c.json({ error: "試行回数が多すぎます。しばらく待ってから再度お試しください" }, 429);
+  }
   const body = await c.req.json().catch(() => null);
   if (!body || !body.code) return c.json({ error: "コードを入力してください" }, 400);
 
@@ -706,6 +722,12 @@ app.post("/programs/:id/confirm-email", async (c) => {
 // メール認証コードの再送信
 app.post("/programs/:id/resend-email-code", async (c) => {
   const id = c.req.param("id");
+  if (
+    !(await checkRateLimit(c.env.DB, `email-resend:programs:${id}`, 3, 10 * 60 * 1000)) ||
+    !(await checkRateLimit(c.env.DB, `email-resend-ip:${clientIp(c)}`, 10, 60 * 60 * 1000))
+  ) {
+    return c.json({ error: "再送の回数が多すぎます。しばらく待ってから再度お試しください" }, 429);
+  }
   const row: any = await c.env.DB.prepare(`SELECT * FROM programs WHERE id = ?`).bind(id).first();
   if (!row) return c.json({ error: "not found" }, 404);
   if (row.email_verified) return c.json({ error: "すでに確認済みです" }, 400);
@@ -943,6 +965,9 @@ app.post("/programs/:id/avatar", async (c) => {
 // =====================================================
 
 app.post("/hunters", async (c) => {
+  if (!(await checkRateLimit(c.env.DB, `register:hunter:${clientIp(c)}`, 10, 60 * 60 * 1000))) {
+    return c.json({ error: "登録の試行回数が多すぎます。しばらく待ってから再度お試しください" }, 429);
+  }
   const body = await c.req.json().catch(() => null);
 
   if (!body || !body.handle || !body.email) {
@@ -1004,6 +1029,9 @@ app.post("/hunters", async (c) => {
 // メール認証コードの確認
 app.post("/hunters/:id/confirm-email", async (c) => {
   const id = c.req.param("id");
+  if (!(await checkRateLimit(c.env.DB, `email-confirm:hunters:${id}`, 10, 15 * 60 * 1000))) {
+    return c.json({ error: "試行回数が多すぎます。しばらく待ってから再度お試しください" }, 429);
+  }
   const body = await c.req.json().catch(() => null);
   if (!body || !body.code) return c.json({ error: "コードを入力してください" }, 400);
 
@@ -1028,6 +1056,12 @@ app.post("/hunters/:id/confirm-email", async (c) => {
 // メール認証コードの再送信
 app.post("/hunters/:id/resend-email-code", async (c) => {
   const id = c.req.param("id");
+  if (
+    !(await checkRateLimit(c.env.DB, `email-resend:hunters:${id}`, 3, 10 * 60 * 1000)) ||
+    !(await checkRateLimit(c.env.DB, `email-resend-ip:${clientIp(c)}`, 10, 60 * 60 * 1000))
+  ) {
+    return c.json({ error: "再送の回数が多すぎます。しばらく待ってから再度お試しください" }, 429);
+  }
   const row: any = await c.env.DB.prepare(`SELECT * FROM hunters WHERE id = ?`).bind(id).first();
   if (!row) return c.json({ error: "not found" }, 404);
   if (row.email_verified) return c.json({ error: "すでに確認済みです" }, 400);
@@ -1755,12 +1789,31 @@ function requireAdmin(c: any): boolean {
   return !!key && !!c.env.ADMIN_KEY && key === c.env.ADMIN_KEY;
 }
 
+// 管理者キーの総当たり対策: 失敗をIPごとに数え、超過中は正しいキーでも拒否する（15分で10回まで）
+const ADMIN_FAIL_MAX = 10;
+const ADMIN_FAIL_WINDOW_MS = 15 * 60 * 1000;
+app.use("/admin/*", async (c, next) => {
+  if (c.req.method === "OPTIONS") return next();
+  const lockKey = `admin-fail:${clientIp(c)}`;
+  if (await isRateLimited(c.env.DB, lockKey, ADMIN_FAIL_MAX, ADMIN_FAIL_WINDOW_MS)) {
+    return c.json({ error: "試行回数が多すぎます。しばらく待ってから再度お試しください" }, 429);
+  }
+  if (!requireAdmin(c)) {
+    await checkRateLimit(c.env.DB, lockKey, ADMIN_FAIL_MAX, ADMIN_FAIL_WINDOW_MS);
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  await next();
+});
+
 // 管理画面から @bughunter.uk の任意アドレスを送信元にしてメールを送る
 // ※ 送信元ドメインは Brevo / Resend 側で bughunter.uk の認証（SPF/DKIM）済みであること
 const MAIL_FROM_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}@bughunter\.uk$/;
 
 app.post("/admin/email/send", async (c) => {
   if (!requireAdmin(c)) return c.json({ error: "unauthorized" }, 401);
+  if (!(await checkRateLimit(c.env.DB, "admin-mail", 20, 60 * 60 * 1000))) {
+    return c.json({ error: "メール送信の回数が上限（1時間に20回）に達しました。しばらく待ってください" }, 429);
+  }
 
   let body: any;
   try {
@@ -2194,6 +2247,9 @@ app.patch("/admin/settings", async (c) => {
 // =====================================================
 
 app.post("/pre-register", async (c) => {
+  if (!(await checkRateLimit(c.env.DB, `pre-register:${clientIp(c)}`, 5, 60 * 60 * 1000))) {
+    return c.json({ error: "試行回数が多すぎます。しばらく待ってから再度お試しください" }, 429);
+  }
   const body = await c.req.json().catch(() => null);
   const email = (body?.email || "").trim();
   const role = body?.role === "program" ? "program" : "hunter";
